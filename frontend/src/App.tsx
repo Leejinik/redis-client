@@ -18,6 +18,7 @@ import {
   ApplyUpdate,
   GetPendingReleaseNotes,
   MarkReleaseNotesSeen,
+  ShowUpdateModeNoticeOnce,
 } from "../wailsjs/go/main/App";
 import { updater } from "../wailsjs/go/models";
 import { EventsOn } from "../wailsjs/runtime";
@@ -174,6 +175,9 @@ export default function App() {
     if (autoApplyFired) return;
     autoApplyFired = true;
     (async () => {
+      // One-time notice: auto-update changed to notify-only due to the corporate
+      // EDR policy. Fire-and-forget (native dialog, self-guarded to show once).
+      ShowUpdateModeNoticeOnce().catch(() => { /* ignore */ });
       // 1) pop release notes stashed by the previous version, if any.
       try {
         const notes = await GetPendingReleaseNotes();
@@ -183,15 +187,12 @@ export default function App() {
       } catch {
         /* no-op */
       }
-      // 2) guarded silent update. Applies silently unless the loop guard trips,
-      //    in which case we show a manual "new version" badge in the banner.
+      // 2) notify-only update check: if a newer build exists, show a manual
+      //    "download" badge. We never self-replace the running exe — endpoint
+      //    security (EDR) quarantines self-updating binaries.
       try {
         const r = await AutoUpdate();
-        if (r?.applying) {
-          setApplyingMsg("업데이트 적용 중… " + (r.info?.latestVersion ?? ""));
-        } else if (r?.blocked && r.info) {
-          setUpdateInfo(r.info);
-        }
+        if (r?.info?.available) setUpdateInfo(r.info);
       } catch {
         /* offline / no repo yet — no-op */
       }
@@ -201,12 +202,13 @@ export default function App() {
 
   async function applyManualUpdate() {
     if (!updateInfo) return;
-    setApplyingMsg("업데이트 적용 중… " + (updateInfo.latestVersion ?? ""));
+    setApplyingMsg("브라우저에서 다운로드 페이지를 엽니다… " + (updateInfo.latestVersion ?? ""));
     try {
-      await ApplyUpdate(updateInfo);
+      await ApplyUpdate(updateInfo); // opens the GitHub release page (no self-replace)
+      window.setTimeout(() => setApplyingMsg(""), 3000);
     } catch (e: Any) {
       setApplyingMsg("");
-      setConnErr("업데이트 실패: " + String(e));
+      setConnErr("다운로드 페이지 열기 실패: " + String(e));
     }
   }
 
@@ -757,11 +759,11 @@ function Banner({ topo, connected, readOnly, profileName, updateInfo, applyingMs
         updateInfo && (
           <span
             className="badge"
-            title="클릭하면 업데이트를 적용합니다"
+            title="브라우저에서 릴리스 페이지를 열어 새 버전을 직접 내려받습니다 (자동 교체 안 함)"
             onClick={onApplyUpdate}
             style={{ background: "#3a2f12", color: "#ffcf6b", cursor: "pointer" }}
           >
-            새 버전 {updateInfo.latestVersion} (수동 업데이트)
+            ⬆️ 새 버전 {updateInfo.latestVersion} — 다운로드
           </span>
         )
       )}
