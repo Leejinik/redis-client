@@ -130,6 +130,7 @@ export default function App() {
   const [rTo, setRTo] = useState("76180");
   const [rItems, setRItems] = useState<Any[]>([]);
   const [rErr, setRErr] = useState("");
+  const [rPivot, setRPivot] = useState(false); // 전치(행↔열) 토글 — Tab 또는 버튼
 
   // write
   const [wOp, setWOp] = useState("set");
@@ -585,31 +586,107 @@ export default function App() {
                   <button className="btn btn-primary" disabled={!connected} onClick={runRange}>MGET</button>
                 </div>
                 {rErr && <div className="err-text">{rErr}</div>}
-                {rItems.length > 0 && (
-                  <div style={{ overflow: "auto" }}>
-                    <table className="result-table">
-                      <thead>
-                        <tr><th>key</th><th>id</th><th>표시값</th><th>시각</th><th>원값</th><th>raw</th></tr>
-                      </thead>
-                      <tbody>
-                        {rItems.map((it) => {
-                          const f: Any = {};
-                          (it.decoded?.fields ?? []).forEach((kv: Any) => (f[kv.field] = kv.value));
-                          return (
-                            <tr key={it.key} className={it.exists ? "" : "row-missing"}>
-                              <td className="mono">{it.key}</td>
-                              <td>{f.id ?? ""}</td>
-                              <td>{f.formatted ?? ""}</td>
-                              <td className="mono">{f.timestamp ?? ""}</td>
-                              <td>{f.raw ?? ""}</td>
-                              <td className="mono wrap">{it.exists ? it.value : "(없음)"}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                {rItems.length > 0 && (() => {
+                  // decoded.fields를 한 번만 펼쳐 정상/전치 뷰가 공유
+                  const rows = rItems.map((it: Any) => {
+                    const f: Any = {};
+                    (it.decoded?.fields ?? []).forEach((kv: Any) => (f[kv.field] = kv.value));
+                    return { it, f };
+                  });
+                  // 전치 뷰의 행 정의: [필드명, 값 접근자, 셀 클래스, 아웃라이어 하이라이트 여부]
+                  // id·raw는 열마다 고유하므로 하이라이트 대상 아님(전체가 튀어 노이즈).
+                  const fieldDefs: [string, (r: Any) => string, string, boolean][] = [
+                    ["id", (r) => r.f.id ?? "", "", false],
+                    ["표시값", (r) => r.f.formatted ?? "", "", true],
+                    ["시각", (r) => r.f.timestamp ?? "", "mono", true],
+                    ["원값", (r) => r.f.raw ?? "", "", true],
+                    ["raw", (r) => (r.it.exists ? r.it.value : "(없음)"), "mono", false],
+                  ];
+                  return (
+                    <>
+                      <div className="inline" style={{ marginTop: 4 }}>
+                        <button className="btn btn-xs" onClick={() => setRPivot((p) => !p)}>
+                          ⇄ 전치 {rPivot ? "해제" : ""}(Tab)
+                        </button>
+                        <span className="hint-text">표에 포커스 후 Tab으로 행/열 전환 · {rItems.length}건</span>
+                      </div>
+                      <div
+                        style={{ overflow: "auto", outline: "none" }}
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === "Tab") {
+                            e.preventDefault();
+                            setRPivot((p) => !p);
+                          }
+                        }}
+                      >
+                        {!rPivot ? (
+                          <table className="result-table">
+                            <thead>
+                              <tr><th>key</th><th>id</th><th>표시값</th><th>시각</th><th>원값</th><th>raw</th></tr>
+                            </thead>
+                            <tbody>
+                              {rows.map(({ it, f }: Any) => (
+                                <tr key={it.key} className={it.exists ? "" : "row-missing"}>
+                                  <td className="mono">{it.key}</td>
+                                  <td>{f.id ?? ""}</td>
+                                  <td>{f.formatted ?? ""}</td>
+                                  <td className="mono">{f.timestamp ?? ""}</td>
+                                  <td>{f.raw ?? ""}</td>
+                                  <td className="mono wrap">{it.exists ? it.value : "(없음)"}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        ) : (
+                          <table className="result-table pivot-table">
+                            <thead>
+                              <tr>
+                                <th className="rowhead corner">필드</th>
+                                {rows.map(({ it, f }: Any) => (
+                                  <th
+                                    key={it.key}
+                                    title={it.key}
+                                    className={"mono" + (it.exists ? "" : " col-missing")}
+                                  >
+                                    {f.id ?? it.key}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {fieldDefs.map(([label, get, cls, hl]) => {
+                                // 하이라이트 기준값 = 첫 유효 셀 값
+                                let base: string | null = null;
+                                if (hl) {
+                                  for (const r of rows) {
+                                    if (r.it.exists) { base = get(r); break; }
+                                  }
+                                }
+                                return (
+                                  <tr key={label}>
+                                    <td className="rowhead">{label}</td>
+                                    {rows.map((r: Any) => {
+                                      const v = get(r);
+                                      const diff = hl && r.it.exists && base !== null && v !== base;
+                                      const c =
+                                        (cls ? cls : "") +
+                                        (r.it.exists ? "" : " col-missing") +
+                                        (diff ? " cell-diff" : "");
+                                      return (
+                                        <td key={r.it.key} className={c.trim()}>{v}</td>
+                                      );
+                                    })}
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
             </div>
           )}

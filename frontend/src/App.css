@@ -112,7 +112,13 @@ input:focus, select:focus, textarea:focus { border-color: #3b6fe0; }
 textarea { resize: vertical; }
 
 .mono {
-  font-family: ui-monospace, "SF Mono", Consolas, "D2Coding", monospace;
+  /* Decoded checkpoint/device values carry Korean and are rendered here, so the
+     Hangul fallback matters as much as it does in the body stack. None of the
+     families above exist on Ubuntu, and generic `monospace` resolves to
+     DejaVu Sans Mono, which has no Hangul at all — fontconfig then substitutes a
+     proportional face mid-line and the columns stop lining up. */
+  font-family: ui-monospace, "SF Mono", Consolas, "D2Coding",
+    "Noto Sans Mono CJK KR", "DejaVu Sans Mono", monospace;
 }
 
 /* ---- badges ---- */
@@ -353,6 +359,19 @@ textarea { resize: vertical; }
 }
 .result-table td.wrap { white-space: normal; word-break: break-all; }
 .row-missing td { color: #6b7480; }
+
+/* ---- pivot (전치) 뷰 ---- */
+/* 첫 열(필드명)을 왼쪽에 고정해 가로 스크롤해도 항상 보이게 */
+.pivot-table td.rowhead, .pivot-table th.rowhead {
+  position: sticky; left: 0;
+  background: #20232a; color: #9aa4b2; font-weight: 600;
+  z-index: 2;
+}
+.pivot-table th { z-index: 1; }                 /* 상단 헤더(sticky-top) */
+.pivot-table th.rowhead.corner { z-index: 3; }  /* 좌상단 코너: top+left 동시 고정 */
+.col-missing { color: #6b7480; }                /* 없는 key 열 dim */
+.cell-diff { background: #332a17; color: #e0b062; } /* 첫 값과 다른 셀(아웃라이어) */
+.hint-text { font-size: 11px; color: #9aa4b2; align-self: center; }
 
 /* ---- modal ---- */
 .modal-backdrop {
