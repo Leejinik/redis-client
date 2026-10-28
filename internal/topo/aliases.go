@@ -18,16 +18,31 @@ func PositionalAliases(nodes []string) map[string]string {
 	return m
 }
 
-// MergedAliases overlays user-supplied aliases on top of the positional ones
-// (user overrides positional).
-func MergedAliases(nodes []string, user map[string]string) map[string]string {
+// MergedAliases layers the alias sources: positional (server_N guess) <
+// learned (what each node says it announces itself as) < user-supplied.
+func MergedAliases(nodes []string, learned, user map[string]string) map[string]string {
 	m := PositionalAliases(nodes)
-	for k, v := range user {
-		if k != "" && v != "" {
-			m[k] = v
+	for _, src := range []map[string]string{learned, user} {
+		for k, v := range src {
+			if k != "" && v != "" {
+				m[k] = v
+			}
 		}
 	}
 	return m
+}
+
+// unresolvedHost returns the host part of addr when it is still a name (not an
+// IP) after alias rewriting, i.e. something the client PC cannot dial.
+func unresolvedHost(addr string) (string, bool) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" || net.ParseIP(host) != nil {
+		return "", false
+	}
+	return host, true
 }
 
 // rewriteHost rewrites the host part of an "host:port" address through the

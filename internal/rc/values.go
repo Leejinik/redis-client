@@ -140,6 +140,7 @@ func readHash(ctx context.Context, cli *redis.Client, key string) ([]KV, bool, e
 type RangeItem struct {
 	Key     string   `json:"key"`
 	Exists  bool     `json:"exists"`
+	Type    string   `json:"type,omitempty"` // when !Exists: "none" (no key) or the non-string type MGET can't read
 	Value   string   `json:"value"`
 	Decoded *Decoded `json:"decoded,omitempty"`
 }
@@ -189,6 +190,24 @@ func (c *Conn) MGet(ctx context.Context, keys []string) ([]RangeItem, error) {
 			item.Decoded = DecodeString(k, item.Value)
 		}
 		out[i] = item
+	}
+
+	// MGET answers nil both for a missing key and for a non-string key (hash,
+	// list…). Ask TYPE for the nil ones so the UI can tell "no such key" from
+	// "exists but not readable here".
+	pipe := cli.Pipeline()
+	cmds := map[int]*redis.StatusCmd{}
+	for i := range out {
+		if !out[i].Exists {
+			cmds[i] = pipe.Type(cctx, out[i].Key)
+		}
+	}
+	if len(cmds) > 0 {
+		if _, err := pipe.Exec(cctx); err == nil {
+			for i, cmd := range cmds {
+				out[i].Type = cmd.Val()
+			}
+		}
 	}
 	return out, nil
 }

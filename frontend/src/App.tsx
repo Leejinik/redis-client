@@ -85,6 +85,13 @@ function fmtBytes(n: number): string {
   return (n / 1024 / 1024).toFixed(2) + " MB";
 }
 
+// missingLabel explains an MGET hole: MGET returns nothing both for a missing
+// key and for a key of another type, which the backend tells apart via TYPE.
+function missingLabel(it: Any): string {
+  if (it.type && it.type !== "none") return `(${it.type} — 범위 조회는 string 키만 읽음, 값 탭에서 보기)`;
+  return "(없음 — 키가 없음)";
+}
+
 function fmtTTL(s: number): string {
   if (s === -1) return "no expire";
   if (s === -2) return "missing";
@@ -126,8 +133,8 @@ export default function App() {
 
   // range
   const [rPrefix, setRPrefix] = useState("checkpoint:");
-  const [rFrom, setRFrom] = useState("76160");
-  const [rTo, setRTo] = useState("76180");
+  const [rFrom, setRFrom] = useState("");
+  const [rTo, setRTo] = useState("");
   const [rItems, setRItems] = useState<Any[]>([]);
   const [rErr, setRErr] = useState("");
   const [rPivot, setRPivot] = useState(false); // 전치(행↔열) 토글 — Tab 또는 버튼
@@ -367,12 +374,16 @@ export default function App() {
   async function runRange() {
     setRErr("");
     setRItems([]);
+    if (!/^\d+$/.test(rFrom.trim()) || !/^\d+$/.test(rTo.trim())) {
+      setRErr("from·to 에 0 이상의 정수를 넣으세요");
+      return;
+    }
     try {
       const items = (await MGetRange(
         selId,
         rPrefix,
-        parseInt(rFrom || "0", 10),
-        parseInt(rTo || "0", 10)
+        parseInt(rFrom, 10),
+        parseInt(rTo, 10)
       )) as Any;
       setRItems((items ?? []) as Any[]);
     } catch (e: Any) {
@@ -387,10 +398,42 @@ export default function App() {
       const t = line.trim();
       if (!t) return;
       const idx = t.indexOf("=");
-      if (idx < 0) return;
+      if (idx <= 0) return; // writeProblem() blocks these before anything is sent
       out[t.slice(0, idx).trim()] = t.slice(idx + 1);
     });
     return out;
+  }
+
+  // writeProblem returns why the current form must not be sent, or "" when OK.
+  // Malformed lines are refused (not silently dropped) and EXPIRE never gets a
+  // TTL <= 0, which Redis treats as "delete now".
+  function writeProblem(): string {
+    if (wOp !== "mset" && !wKey.trim()) return "키를 입력하세요";
+    if (wOp === "set" && wTtl.trim() !== "" && !/^\d+$/.test(wTtl.trim()))
+      return "TTL 은 0 이상의 정수(초)로 넣으세요 (0 = 만료 없음)";
+    if (wOp === "expire" && !(/^\d+$/.test(wTtl.trim()) && parseInt(wTtl, 10) >= 1))
+      return "EXPIRE 의 TTL 은 1 이상의 정수(초)만 됩니다 — 0 은 Redis 가 키를 즉시 삭제합니다. 삭제는 DEL 을 쓰세요";
+    if (wOp === "hset" || wOp === "mset") {
+      const bad: number[] = [];
+      let good = 0;
+      wFields.split("\n").forEach((line, i) => {
+        const s = line.trim();
+        if (!s) return;
+        if (s.indexOf("=") <= 0) bad.push(i + 1);
+        else good++;
+      });
+      if (bad.length > 0)
+        return `${bad.join(", ")}행이 ${wOp === "hset" ? "field=value" : "key=value"} 형식이 아닙니다 — 고친 뒤 실행하세요`;
+      if (good === 0) return "한 줄 이상 입력하세요";
+    }
+    return "";
+  }
+
+  function openConfirm() {
+    const p = writeProblem();
+    setWErr(p);
+    setWResults([]);
+    if (!p) setConfirmOpen(true);
   }
 
   function buildOps(): Any[] {
@@ -412,6 +455,11 @@ export default function App() {
     setConfirmOpen(false);
     setWErr("");
     setWResults([]);
+    const p = writeProblem();
+    if (p) {
+      setWErr(p);
+      return;
+    }
     try {
       const res = (await Write(selId, buildOps() as Any)) as Any;
       setWResults((res ?? []) as Any[]);
@@ -585,6 +633,7 @@ export default function App() {
                   <label>to<input style={{ width: 100 }} value={rTo} onChange={(e) => setRTo(e.target.value)} /></label>
                   <button className="btn btn-primary" disabled={!connected} onClick={runRange}>MGET</button>
                 </div>
+                <div className="hint-text">키 이름 = 접두어 + 숫자(from~to, 양 끝 포함). 문자열(string) 키만 읽습니다 — hash 등은 값 탭에서 보세요.</div>
                 {rErr && <div className="err-text">{rErr}</div>}
                 {rItems.length > 0 && (() => {
                   // decoded.fields를 한 번만 펼쳐 정상/전치 뷰가 공유
@@ -600,7 +649,7 @@ export default function App() {
                     ["표시값", (r) => r.f.formatted ?? "", "", true],
                     ["시각", (r) => r.f.timestamp ?? "", "mono", true],
                     ["원값", (r) => r.f.raw ?? "", "", true],
-                    ["raw", (r) => (r.it.exists ? r.it.value : "(없음)"), "mono", false],
+                    ["raw", (r) => (r.it.exists ? r.it.value : missingLabel(r.it)), "mono", false],
                   ];
                   return (
                     <>
@@ -633,7 +682,7 @@ export default function App() {
                                   <td>{f.formatted ?? ""}</td>
                                   <td className="mono">{f.timestamp ?? ""}</td>
                                   <td>{f.raw ?? ""}</td>
-                                  <td className="mono wrap">{it.exists ? it.value : "(없음)"}</td>
+                                  <td className="mono wrap">{it.exists ? it.value : missingLabel(it)}</td>
                                 </tr>
                               ))}
                             </tbody>
@@ -716,8 +765,11 @@ export default function App() {
                 {wOp === "set" && (
                   <label>값<input className="mono" value={wValue} onChange={(e) => setWValue(e.target.value)} /></label>
                 )}
-                {(wOp === "set" || wOp === "expire") && (
-                  <label>TTL (초, 0=없음)<input style={{ width: 120 }} value={wTtl} onChange={(e) => setWTtl(e.target.value)} /></label>
+                {wOp === "set" && (
+                  <label>TTL (초, 0=만료 없음)<input style={{ width: 120 }} value={wTtl} onChange={(e) => setWTtl(e.target.value)} /></label>
+                )}
+                {wOp === "expire" && (
+                  <label>TTL (초, 1 이상 — 0 은 키 삭제라 막혀 있음)<input style={{ width: 120 }} value={wTtl} onChange={(e) => setWTtl(e.target.value)} /></label>
                 )}
                 {(wOp === "hset" || wOp === "mset") && (
                   <label>
@@ -729,7 +781,7 @@ export default function App() {
                   <button
                     className="btn btn-danger"
                     disabled={!connected || readOnly}
-                    onClick={() => setConfirmOpen(true)}
+                    onClick={openConfirm}
                   >
                     실행
                   </button>
@@ -820,6 +872,9 @@ function Banner({ topo, connected, readOnly, profileName, updateInfo, applyingMs
             </span>
           </div>
           <span className="topo-sub">src: {topo.source}</span>
+          {(topo.warnings ?? []).length > 0 && (
+            <span className="topo-warn">⚠ {(topo.warnings ?? []).join(" / ")}</span>
+          )}
         </>
       ) : (
         <span className="topo-sub">{connected ? "마스터 탐색 중…" : "연결 안 됨"}</span>

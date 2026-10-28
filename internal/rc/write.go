@@ -112,6 +112,12 @@ func (c *Conn) Write(ctx context.Context, ops []WriteOp) ([]WriteResult, error) 
 				r.Err = "key required"
 				break
 			}
+			// EXPIRE with 0 or a negative TTL deletes the key immediately in
+			// Redis — never let a "TTL" field silently become a DEL.
+			if op.TTLSeconds <= 0 {
+				r.Err = "EXPIRE 는 1초 이상만 보낼 수 있습니다 (0 이하는 Redis 가 키를 즉시 삭제합니다 — 삭제는 DEL 을 쓰세요)"
+				break
+			}
 			ok, err := cli.Expire(cctx, op.Key, time.Duration(op.TTLSeconds)*time.Second).Result()
 			if err != nil {
 				r.Err = err.Error()

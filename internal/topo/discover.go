@@ -6,8 +6,9 @@
 // The #1 correctness concern is that Sentinel and INFO report addresses by
 // hostname (`server_1`), never IP, and those hostnames do not resolve off the
 // servers. We solve this two ways that reinforce each other:
-//   - a positional alias map (server_N -> nodes[N-1]) rewrites any hostname to
-//     an IP at dial time (see aliases.go), and
+//   - an alias map rewrites any hostname to an IP at dial time (see
+//     aliases.go): names each node says it announces itself as (learned), the
+//     positional server_N -> nodes[N-1] guess, and user overrides, and
 //   - direct INFO-replication probing of the supplied node IPs classifies
 //     master/replica by role without depending on hostname resolution at all.
 package topo
@@ -18,6 +19,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -112,7 +114,7 @@ func (t Topology) ReplicaAddrs() []string {
 // nil); on total failure Master is nil and Warnings explains why.
 func Discover(ctx context.Context, cfg Config) Topology {
 	cfg = cfg.withDefaults()
-	aliases := MergedAliases(cfg.Nodes, cfg.Aliases)
+	aliases := MergedAliases(cfg.Nodes, learnAnnounced(ctx, cfg), cfg.Aliases)
 	t := Topology{MasterName: cfg.MasterName, DiscoveredAt: time.Now().UnixMilli()}
 
 	// --- 1. Sentinel pass: ping each node's sentinel, and from the first
@@ -137,8 +139,9 @@ func Discover(ctx context.Context, cfg Config) Topology {
 				for _, o := range others {
 					if !sentinelSeen[o] {
 						sentinelSeen[o] = true
+						_, unresolved := unresolvedHost(o) // a bare name can't be dialed from here
 						t.Sentinels = append(t.Sentinels, SentinelNode{
-							Addr: o, Up: ping(ctx, o, cfg.SentinelPassword, cfg.Timeout),
+							Addr: o, Up: !unresolved && ping(ctx, o, cfg.SentinelPassword, cfg.Timeout),
 						})
 					}
 				}
@@ -175,13 +178,88 @@ func Discover(ctx context.Context, cfg Config) Topology {
 			t.Replicas = reps
 			t.Source = "sentinel"
 		} else {
-			t.Warnings = append(t.Warnings, "sentinel master "+sentinelMaster+" did not verify as role:master")
+			if host, ok := unresolvedHost(sentinelMaster); ok {
+				t.Warnings = append(t.Warnings, fmt.Sprintf(
+					"Sentinel 이 마스터를 %q 라는 이름으로 알려 줬는데 IP 를 몰라 확인하지 못했습니다 — 노드 목록에 그 서버 IP 를 넣거나 별칭에 %s=<IP> 를 넣으세요",
+					host, host))
+			} else {
+				t.Warnings = append(t.Warnings, "sentinel master "+sentinelMaster+" did not verify as role:master")
+			}
 		}
 	default:
 		t.Warnings = append(t.Warnings, "no master found: no reachable sentinel and no node reports role:master")
 	}
 
+	t.Warnings = append(t.Warnings, unresolvedWarnings(t)...)
 	return t
+}
+
+// unresolvedWarnings lists names that are still not IPs after alias rewriting.
+// Those entries cannot be dialed from this PC, so they show as separate (and
+// usually down) nodes — the user needs to know why and how to fix it.
+func unresolvedWarnings(t Topology) []string {
+	var addrs []string
+	if t.Master != nil {
+		addrs = append(addrs, t.Master.Addr)
+	}
+	for _, r := range t.Replicas {
+		addrs = append(addrs, r.Addr)
+	}
+	for _, s := range t.Sentinels {
+		addrs = append(addrs, s.Addr)
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, a := range addrs {
+		if host, ok := unresolvedHost(a); ok && !seen[host] {
+			seen[host] = true
+			names = append(names, host)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"이름 %s 을(를) IP 로 바꾸지 못해 별도 노드로 표시됩니다 — 프로필 별칭에 이름=IP 를 넣으세요",
+		strings.Join(names, ", "))}
+}
+
+// learnAnnounced asks every node which name it announces itself under — redis
+// `replica-announce-ip` and sentinel `announce-ip` — and maps that name to the
+// node's IP. Liz installs announce names like `server01` that the positional
+// server_N guess does not cover, and asking the node does not depend on the
+// order of the profile's node list. Nodes that are down or refuse CONFIG are
+// simply skipped.
+func learnAnnounced(ctx context.Context, cfg Config) map[string]string {
+	type hit struct{ name, ip string }
+	hits := make(chan hit, 2*len(cfg.Nodes))
+	var wg sync.WaitGroup
+	ask := func(node, addr, password string, args ...interface{}) {
+		defer wg.Done()
+		cli := newClient(addr, password)
+		defer cli.Close()
+		res, err := do(ctx, cli, cfg.Timeout, args...)
+		if err != nil {
+			return
+		}
+		if kv := toStrings(res); len(kv) == 2 && kv[1] != "" && net.ParseIP(kv[1]) == nil {
+			hits <- hit{name: kv[1], ip: node}
+		}
+	}
+	for _, node := range cfg.Nodes {
+		wg.Add(2)
+		go ask(node, net.JoinHostPort(node, strconv.Itoa(cfg.RedisPort)), cfg.Password,
+			"CONFIG", "GET", "replica-announce-ip")
+		go ask(node, net.JoinHostPort(node, strconv.Itoa(cfg.SentinelPort)), cfg.SentinelPassword,
+			"SENTINEL", "CONFIG", "GET", "announce-ip")
+	}
+	wg.Wait()
+	close(hits)
+	m := map[string]string{}
+	for h := range hits {
+		m[h.name] = h.ip
+	}
+	return m
 }
 
 // sentinelDiscover queries one reachable sentinel for the master address,
@@ -280,6 +358,9 @@ func probeAll(ctx context.Context, cfg Config, aliases map[string]string) (maste
 // verifyMaster connects to a sentinel-reported master addr and confirms
 // role:master via INFO, returning the node + its replicas.
 func verifyMaster(ctx context.Context, addr string, cfg Config, aliases map[string]string) (*RedisNode, []RedisNode, bool) {
+	if _, unresolved := unresolvedHost(addr); unresolved {
+		return nil, nil, false // would only wait out a DNS/dial timeout
+	}
 	info, up, err := infoReplication(ctx, addr, cfg.Password, cfg.Timeout)
 	if err != nil || !up || info.role != "master" {
 		return nil, nil, false
