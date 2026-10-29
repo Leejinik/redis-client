@@ -77,7 +77,7 @@ type RedisNode struct {
 type SentinelNode struct {
 	Addr   string `json:"addr"`
 	Up     bool   `json:"up"`
-	Source string `json:"source"` // "profile" (a profile node) | "announced" (reported by a sentinel)
+	Source string `json:"source"` // "profile" (typed in) | "found" (found via CLIENT LIST) | "announced" (reported by a sentinel)
 }
 
 // Topology is the full picture handed to the UI.
@@ -89,6 +89,7 @@ type Topology struct {
 	Quorum       int            `json:"quorum"`
 	Source       string         `json:"source"` // "sentinel" | "direct-probe" | "sentinel+probe"
 	Warnings     []string       `json:"warnings,omitempty"`
+	FoundNodes   []string       `json:"foundNodes,omitempty"` // node IPs found via CLIENT LIST that aren't in the profile
 	DiscoveredAt int64          `json:"discoveredAt"` // unix ms
 }
 
@@ -115,8 +116,19 @@ func (t Topology) ReplicaAddrs() []string {
 // nil); on total failure Master is nil and Warnings explains why.
 func Discover(ctx context.Context, cfg Config) Topology {
 	cfg = cfg.withDefaults()
-	aliases := MergedAliases(cfg.Nodes, learnAnnounced(ctx, cfg), cfg.Aliases)
+	given := cfg.Nodes
+	cfg.Nodes = expandNodes(ctx, cfg) // one reachable IP is enough; the rest are found
+	aliases := MergedAliases(given, learnAnnounced(ctx, cfg), cfg.Aliases)
 	t := Topology{MasterName: cfg.MasterName, DiscoveredAt: time.Now().UnixMilli()}
+	inProfile := map[string]bool{}
+	for _, n := range given {
+		inProfile[n] = true
+	}
+	for _, n := range cfg.Nodes {
+		if !inProfile[n] {
+			t.FoundNodes = append(t.FoundNodes, n)
+		}
+	}
 
 	// --- 1. Sentinel pass: ping each node's sentinel, and from the first
 	// reachable one pull master addr, quorum, and the sentinel roster. ---
@@ -134,7 +146,11 @@ func Discover(ctx context.Context, cfg Config) Topology {
 		}
 		sentinelSeen[saddr] = true
 		up := ping(ctx, saddr, cfg.SentinelPassword, cfg.Timeout)
-		t.Sentinels = append(t.Sentinels, SentinelNode{Addr: saddr, Up: up, Source: "profile"})
+		src := "profile"
+		if !inProfile[node] {
+			src = "found"
+		}
+		t.Sentinels = append(t.Sentinels, SentinelNode{Addr: saddr, Up: up, Source: src})
 		if up && !discovered {
 			if m, q, others, ok := sentinelDiscover(ctx, saddr, cfg, aliases); ok {
 				sentinelMaster = m
@@ -227,6 +243,92 @@ func unresolvedWarnings(t Topology) []string {
 	return []string{fmt.Sprintf(
 		"이름 %s 을(를) IP 로 바꾸지 못해 별도 노드로 표시됩니다 — 프로필 별칭에 이름=IP 를 넣으세요",
 		strings.Join(names, ", "))}
+}
+
+// expandNodes widens a short node list (often a single IP) to every redis node
+// of the deployment. Sentinel and INFO only report announce names (server03),
+// but CLIENT LIST shows real peer IPs: a replica's master link (TYPE master)
+// carries the master's IP, and the master's replica links (TYPE replica) carry
+// each replica's IP. Liz runs a sentinel next to every redis, so these IPs also
+// cover the sentinels. Given nodes keep their order and found ones are
+// appended; a node that refuses CLIENT just adds nothing (old behavior).
+func expandNodes(ctx context.Context, cfg Config) []string {
+	out := append([]string(nil), cfg.Nodes...)
+	seen := map[string]bool{}
+	for _, n := range out {
+		seen[n] = true
+	}
+	add := func(host string) {
+		ip := net.ParseIP(host)
+		if ip == nil || ip.IsLoopback() || seen[host] {
+			return
+		}
+		seen[host] = true
+		out = append(out, host)
+	}
+	hostOf := func(addr string) string {
+		h, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return ""
+		}
+		return h
+	}
+
+	master := ""
+	for _, node := range cfg.Nodes {
+		addr := net.JoinHostPort(node, strconv.Itoa(cfg.RedisPort))
+		info, up, _ := infoReplication(ctx, addr, cfg.Password, cfg.Timeout)
+		if !up {
+			continue
+		}
+		if info.role == "master" {
+			master = node
+			break
+		}
+		for _, c := range clientList(ctx, addr, cfg, "master") {
+			if strings.Contains(c["flags"], "M") {
+				master = hostOf(c["addr"])
+			}
+		}
+		if master != "" {
+			break
+		}
+	}
+	if master == "" {
+		return out
+	}
+	add(master)
+	for _, c := range clientList(ctx, net.JoinHostPort(master, strconv.Itoa(cfg.RedisPort)), cfg, "replica") {
+		if strings.Contains(c["flags"], "S") {
+			add(hostOf(c["addr"]))
+		}
+	}
+	return out
+}
+
+// clientList runs `CLIENT LIST TYPE <typ>` and splits each line into its
+// key=value fields. Returns nil when the command is refused or renamed.
+func clientList(ctx context.Context, addr string, cfg Config, typ string) []map[string]string {
+	cli := newClient(addr, cfg.Password)
+	defer cli.Close()
+	res, err := do(ctx, cli, cfg.Timeout, "CLIENT", "LIST", "TYPE", typ)
+	if err != nil {
+		return nil
+	}
+	s, _ := res.(string)
+	var out []map[string]string
+	for _, line := range strings.Split(s, "\n") {
+		m := map[string]string{}
+		for _, f := range strings.Fields(line) {
+			if k, v, ok := strings.Cut(f, "="); ok {
+				m[k] = v
+			}
+		}
+		if len(m) > 0 {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // learnAnnounced asks every node which name it announces itself under — redis

@@ -350,6 +350,16 @@ export default function App() {
     }
   }
 
+  // saveFoundNodes adds the servers discovery found to the profile, so a later
+  // connect can start from any of them. Saving drops the live connection, so
+  // reconnect right after.
+  async function saveFoundNodes() {
+    const found: string[] = topo?.foundNodes ?? [];
+    if (!selProfile || found.length === 0) return;
+    await saveProfile({ ...selProfile, nodes: [...selProfile.nodes, ...found.filter((n) => !selProfile.nodes.includes(n))] });
+    await connect();
+  }
+
   async function disconnect() {
     if (!selId) return;
     await Disconnect(selId);
@@ -704,6 +714,14 @@ export default function App() {
                   <button className="btn btn-xs" onClick={() => removeProfile(selProfile)}>삭제</button>
                 </>
               )}
+            </div>
+          )}
+          {connected && (topo?.foundNodes ?? []).length > 0 && (
+            <div className="hint-line">
+              프로필에 없는 서버 {topo.foundNodes.length}대를 찾았습니다: <span className="mono">{topo.foundNodes.join(", ")}</span>
+              <br />
+              저장해 두면 처음 넣은 서버가 꺼져 있어도 다른 서버로 연결을 시작할 수 있어요.{" "}
+              <button className="btn btn-xs" disabled={busy} onClick={saveFoundNodes}>프로필에 저장</button>
             </div>
           )}
           {connErr && (
@@ -1206,7 +1224,9 @@ function SentinelBox({ topo, sentinels }: Any) {
               <span className={"topo-dot " + (s.up ? "dot-up" : "dot-down")} />
               <span className="mono">{s.addr}</span>
               <span>{s.up ? "응답" : "응답 없음"}</span>
-              <span className="dim">{s.source === "announced" ? "Sentinel 이 알려 준 주소" : "프로필 노드"}</span>
+              <span className="dim">
+                {s.source === "announced" ? "Sentinel 이 알려 준 주소" : s.source === "found" ? "연결하며 찾은 서버" : "프로필 노드"}
+              </span>
             </div>
           ))}
           <div className="pop-foot">quorum {topo.quorum} — 마스터 장애를 확정하는 데 필요한 Sentinel 동의 수 (서버 설정값)</div>
@@ -1450,7 +1470,7 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
             <div className="hint-text">Sentinel 구성(Liz 표준)에 연결합니다. * 는 꼭 넣어야 하는 칸입니다.</div>
             <label>이름 *<input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: liz 운영" /></label>
             <label>
-              서버 IP * (Redis·Sentinel 이 함께 있는 서버를 모두 — 쉼표/공백 구분)
+              서버 IP * (아무 서버 하나만 넣어도 됩니다 — 나머지는 연결할 때 찾아요. 여러 개면 살아 있는 곳에서 시작)
               <input
                 className="mono"
                 value={nodesText}
