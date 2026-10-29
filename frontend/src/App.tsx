@@ -171,6 +171,7 @@ export default function App() {
   const [topo, setTopo] = useState<Any>(null);
   const [connErr, setConnErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [foundNote, setFoundNote] = useState("");
 
   // auto-update
   const [updateInfo, setUpdateInfo] = useState<updater.UpdateInfo | null>(null); // manual badge
@@ -319,6 +320,7 @@ export default function App() {
     setValue(null);
     setMeta(null);
     setConnErr("");
+    setFoundNote("");
     try {
       const isc = (await IsConnected(id)) as Any;
       setConnected(!!isc);
@@ -338,26 +340,23 @@ export default function App() {
     if (!selId) return;
     setBusy(true);
     setConnErr("");
+    setFoundNote("");
     try {
       const t = (await Connect(selId)) as Any;
       setTopo(t);
       setConnected(true);
+      // the backend already wrote any servers it found into the profile
+      const found: string[] = t?.foundNodes ?? [];
+      if (found.length > 0) {
+        setFoundNote(`찾은 서버 ${found.length}대(${found.join(", ")})를 프로필에 저장했어요. 다음엔 이 중 아무 서버로나 연결을 시작해요.`);
+        await loadProfiles();
+      }
     } catch (e: Any) {
       setConnErr(String(e));
       setConnected(false);
     } finally {
       setBusy(false);
     }
-  }
-
-  // saveFoundNodes adds the servers discovery found to the profile, so a later
-  // connect can start from any of them. Saving drops the live connection, so
-  // reconnect right after.
-  async function saveFoundNodes() {
-    const found: string[] = topo?.foundNodes ?? [];
-    if (!selProfile || found.length === 0) return;
-    await saveProfile({ ...selProfile, nodes: [...selProfile.nodes, ...found.filter((n) => !selProfile.nodes.includes(n))] });
-    await connect();
   }
 
   async function disconnect() {
@@ -716,14 +715,7 @@ export default function App() {
               )}
             </div>
           )}
-          {connected && (topo?.foundNodes ?? []).length > 0 && (
-            <div className="hint-line">
-              프로필에 없는 서버 {topo.foundNodes.length}대를 찾았습니다: <span className="mono">{topo.foundNodes.join(", ")}</span>
-              <br />
-              저장해 두면 처음 넣은 서버가 꺼져 있어도 다른 서버로 연결을 시작할 수 있어요.{" "}
-              <button className="btn btn-xs" disabled={busy} onClick={saveFoundNodes}>프로필에 저장</button>
-            </div>
-          )}
+          {connected && foundNote && <div className="hint-line">{foundNote}</div>}
           {connErr && (
             <div className="err-text">
               연결하지 못했습니다.
@@ -1432,7 +1424,7 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
       return;
     }
     if (nodes.length === 0) {
-      alert("서버 IP 를 하나 이상 입력하세요.");
+      alert("Redis-Sentinel 서버 IP 를 입력하세요.");
       return;
     }
     if (!password) {
@@ -1470,12 +1462,12 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
             <div className="hint-text">Sentinel 구성(Liz 표준)에 연결합니다. * 는 꼭 넣어야 하는 칸입니다.</div>
             <label>이름 *<input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: liz 운영" /></label>
             <label>
-              서버 IP * (아무 서버 하나만 넣어도 됩니다 — 나머지는 연결할 때 찾아요. 여러 개면 살아 있는 곳에서 시작)
+              Redis-Sentinel 서버 IP * (하나만 넣으세요 — 연결하면 나머지 서버를 찾아 여기에 저장해요)
               <input
                 className="mono"
                 value={nodesText}
                 onChange={(e) => setNodesText(e.target.value)}
-                placeholder="172.17.64.24, 172.17.64.25, 172.17.64.26"
+                placeholder="예: 172.17.64.130"
               />
             </label>
             <div className="row2">

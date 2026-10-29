@@ -128,13 +128,41 @@ func (a *App) DeleteProfile(id string) error {
 // ---- Connection ----
 
 // Connect resolves the master (and starts the failover watcher) for a profile,
-// returning the initial topology.
+// returning the initial topology. Servers that discovery found beyond the
+// profile's node list (often the user typed a single IP) are written back to
+// the profile, so a later connect can start from any of them.
 func (a *App) Connect(profileID string) (topo.Topology, error) {
 	p, err := a.profiles.Get(profileID)
 	if err != nil {
 		return topo.Topology{}, err
 	}
-	return a.mgr.Connect(a.ctx, p)
+	t, err := a.mgr.Connect(a.ctx, p)
+	if err == nil && len(t.FoundNodes) > 0 {
+		// Saved straight to the store, not via SaveProfile, so the live
+		// connection stays up.
+		p.Nodes = appendNew(p.Nodes, t.FoundNodes)
+		if _, serr := a.profiles.Save(p); serr != nil {
+			t.Warnings = append(t.Warnings, "찾은 서버를 프로필에 저장하지 못했습니다: "+serr.Error())
+			t.FoundNodes = nil
+		}
+	}
+	return t, err
+}
+
+// appendNew appends the items of add that base doesn't already contain.
+func appendNew(base, add []string) []string {
+	out := append([]string(nil), base...)
+	have := map[string]bool{}
+	for _, s := range base {
+		have[s] = true
+	}
+	for _, s := range add {
+		if !have[s] {
+			have[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (a *App) Disconnect(profileID string) {
