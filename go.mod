@@ -3,12 +3,14 @@ module redis-client
 go 1.25.0
 
 require (
+	github.com/go-sql-driver/mysql v1.8.1
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.20.0
 	github.com/wailsapp/wails/v2 v2.12.0
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

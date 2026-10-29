@@ -22,6 +22,14 @@ const (
 	DefaultRedisPort    = 5000
 	DefaultSentinelPort = 26379
 	DefaultMasterName   = "mymaster"
+	DefaultDBPort       = 3306
+)
+
+// Profile kinds. Profiles saved before MariaDB support have an empty Kind and
+// are Redis-Sentinel profiles.
+const (
+	KindRedis   = "redis"
+	KindMariaDB = "mariadb"
 )
 
 // Profile is a single connection target. The node list length is arbitrary
@@ -30,6 +38,7 @@ const (
 type Profile struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Kind string `json:"kind"` // KindRedis (also "") | KindMariaDB
 
 	Nodes            []string          `json:"nodes"`            // ordered redis node IPs/hosts
 	RedisPort        int               `json:"redisPort"`        // default 5000
@@ -39,6 +48,11 @@ type Profile struct {
 	SentinelPassword string            `json:"sentinelPassword"` // usually empty
 	Aliases          map[string]string `json:"aliases"`          // manual hostname->IP overrides
 	ReadOnly         bool              `json:"readOnly"`         // safety switch; default true
+
+	// MariaDB only. Nodes holds the server IPs and Password the DB password.
+	DBPort   int    `json:"dbPort"`   // default 3306
+	DBUser   string `json:"dbUser"`   // login account
+	Database string `json:"database"` // default schema, may be empty
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -55,8 +69,14 @@ func (p Profile) WithDefaults() Profile {
 	if p.MasterName == "" {
 		p.MasterName = DefaultMasterName
 	}
+	if p.DBPort == 0 {
+		p.DBPort = DefaultDBPort
+	}
 	return p
 }
+
+// IsMariaDB reports whether the profile targets MariaDB rather than Redis.
+func (p Profile) IsMariaDB() bool { return p.Kind == KindMariaDB }
 
 type file struct {
 	Version  int       `json:"version"`

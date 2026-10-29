@@ -5,6 +5,8 @@ import {
   SaveProfile,
   DeleteProfile,
   Connect,
+  ConnectDB,
+  GetDBInfo,
   Disconnect,
   IsConnected,
   GetTopology,
@@ -32,6 +34,7 @@ let autoApplyFired = false;
 interface Profile {
   id: string;
   name: string;
+  kind?: string; // "redis" (also "" on old profiles) | "mariadb"
   nodes: string[];
   redisPort: number;
   sentinelPort: number;
@@ -40,6 +43,9 @@ interface Profile {
   sentinelPassword: string;
   aliases: Record<string, string>;
   readOnly: boolean;
+  dbPort: number; // MariaDB only (and dbUser, database)
+  dbUser: string;
+  database: string;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -47,6 +53,7 @@ interface Profile {
 const blankProfile = (): Profile => ({
   id: "",
   name: "",
+  kind: "redis",
   nodes: [],
   redisPort: 5000,
   sentinelPort: 26379,
@@ -55,7 +62,12 @@ const blankProfile = (): Profile => ({
   sentinelPassword: "",
   aliases: {},
   readOnly: true,
+  dbPort: 3306,
+  dbUser: "",
+  database: "",
 });
+
+const isMariaDB = (p: Profile | null | undefined) => p?.kind === "mariadb";
 
 type Any = any;
 
@@ -142,6 +154,32 @@ function summarizeConnErr(raw: string): string[] {
   return out;
 }
 
+// summarizeDBErr turns the per-server MariaDB errors ("addr: error", one per
+// line) into plain lines.
+function summarizeDBErr(raw: string): string[] {
+  const out: string[] = [];
+  const add = (s: string) => {
+    if (!out.includes(s)) out.push(s);
+  };
+  raw
+    .replace(/^Error: /, "")
+    .split("\n")
+    .filter(Boolean)
+    .forEach((line) => {
+      const m = line.match(/^([^ ]+:\d+): (.*)$/);
+      const who = m ? m[1] : "";
+      const why = m ? m[2] : line;
+      if (/Error 1045/.test(why)) add("사용자 이름이나 비밀번호가 틀렸습니다");
+      else if (/Error 1049/.test(why)) add(`데이터베이스 ${(why.match(/'([^']*)'/) || [])[1] ?? ""} 가 없습니다`);
+      else if (/Error 1130/.test(why)) add(`${who} — 이 PC 에서는 접속이 허용되지 않은 계정입니다`);
+      else if (/refused/i.test(why)) add(`${who} — 연결을 거부했습니다 (포트가 닫혀 있거나 MariaDB 가 꺼져 있음)`);
+      else if (/timeout|deadline exceeded/i.test(why)) add(`${who} — 응답이 없습니다 (시간 초과)`);
+      else if (/no such host/i.test(why)) add(`${who} — 이 이름의 서버를 찾을 수 없습니다`);
+      else add(why);
+    });
+  return out;
+}
+
 function fmtBytes(n: number): string {
   if (!n) return "-";
   if (n < 1024) return n + " B";
@@ -172,6 +210,7 @@ export default function App() {
   const [connErr, setConnErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [foundNote, setFoundNote] = useState("");
+  const [dbInfo, setDbInfo] = useState<Any>(null); // MariaDB connection, see internal/mdb.Info
 
   // auto-update
   const [updateInfo, setUpdateInfo] = useState<updater.UpdateInfo | null>(null); // manual badge
@@ -321,18 +360,19 @@ export default function App() {
     setMeta(null);
     setConnErr("");
     setFoundNote("");
+    setTopo(null);
+    setDbInfo(null);
     try {
       const isc = (await IsConnected(id)) as Any;
       setConnected(!!isc);
-      if (isc) {
+      if (isc && isMariaDB(profiles.find((p) => p.id === id))) {
+        setDbInfo(await GetDBInfo(id));
+      } else if (isc) {
         const t = (await GetTopology(id)) as Any;
         setTopo(t);
-      } else {
-        setTopo(null);
       }
     } catch {
       setConnected(false);
-      setTopo(null);
     }
   }
 
@@ -342,6 +382,11 @@ export default function App() {
     setConnErr("");
     setFoundNote("");
     try {
+      if (isMariaDB(selProfile)) {
+        setDbInfo(await ConnectDB(selId));
+        setConnected(true);
+        return;
+      }
       const t = (await Connect(selId)) as Any;
       setTopo(t);
       setConnected(true);
@@ -364,6 +409,7 @@ export default function App() {
     await Disconnect(selId);
     setConnected(false);
     setTopo(null);
+    setDbInfo(null);
   }
 
   // ---- profile form ----
@@ -630,6 +676,7 @@ export default function App() {
   }
 
   const readOnly = selProfile ? selProfile.readOnly : true;
+  const isDB = isMariaDB(selProfile);
 
   // ---------------- render ----------------
   return (
@@ -637,6 +684,8 @@ export default function App() {
       <Banner
         topo={topo}
         connected={connected}
+        isDB={isDB}
+        dbInfo={dbInfo}
         readOnly={readOnly}
         profileName={selProfile?.name || ""}
         updateInfo={updateInfo}
@@ -687,7 +736,9 @@ export default function App() {
               >
                 <div className="pname">{p.name}</div>
                 <div className="pmeta mono">
-                  {p.nodes.join(", ")} · {p.masterName}
+                  {isMariaDB(p)
+                    ? `MariaDB · ${p.nodes.join(", ")} · ${p.dbUser}${p.database ? " · " + p.database : ""}`
+                    : `Redis · ${p.nodes.join(", ")} · ${p.masterName}`}
                   {p.readOnly ? " · 읽기 전용" : " · 쓰기 가능"}
                 </div>
               </div>
@@ -719,7 +770,7 @@ export default function App() {
           {connErr && (
             <div className="err-text">
               연결하지 못했습니다.
-              {summarizeConnErr(connErr).map((s, i) => (
+              {(isDB ? summarizeDBErr(connErr) : summarizeConnErr(connErr)).map((s, i) => (
                 <div key={i}>· {s}</div>
               ))}
               <details style={{ marginTop: 6 }}>
@@ -730,6 +781,19 @@ export default function App() {
           )}
         </div>
 
+        {isDB ? (
+          <div className="col" style={{ gridColumn: "span 2" }}>
+            <div className="col-head">
+              <span className="grow">MariaDB</span>
+            </div>
+            {connected && dbInfo ? (
+              <DBInfoView info={dbInfo} />
+            ) : (
+              <div className="empty">연결 후 사용할 수 있습니다.</div>
+            )}
+          </div>
+        ) : (
+        <>
         {/* ---- middle: key browser ---- */}
         <div className="col">
           <div className="col-head">
@@ -1027,6 +1091,8 @@ export default function App() {
             </div>
           )}
         </div>
+        </>
+        )}
       </div>
 
       {confirmOpen && (
@@ -1100,15 +1166,37 @@ export default function App() {
 }
 
 // ---------------- Banner ----------------
-function Banner({ topo, connected, readOnly, profileName, updateInfo, applyingMsg, onApplyUpdate }: Any) {
+function Banner({ topo, connected, isDB, dbInfo, readOnly, profileName, updateInfo, applyingMsg, onApplyUpdate }: Any) {
   const master = topo?.master;
+  const g = dbInfo?.galera;
   const replicas = topo?.replicas ?? [];
   const sentinels = topo?.sentinels ?? [];
   return (
     <div className="banner">
       <span className="title">REDIS CLIENT</span>
       {profileName && <span className="topo-sub">{profileName}</span>}
-      {connected && master ? (
+      {isDB ? (
+        connected && dbInfo ? (
+          <>
+            <div className="topo-item" title="앱이 지금 붙어 있는 MariaDB 서버입니다.">
+              <span className="topo-dot dot-up" />
+              <span className="badge badge-db">MARIADB</span>
+              <b className="mono">{dbInfo.addr}</b>
+              <span className="topo-sub">{dbInfo.hostname} · {dbInfo.version}</span>
+            </div>
+            {g && (
+              <span
+                className={g.localState === "Synced" && g.clusterStatus === "Primary" ? "topo-sub" : "topo-warn"}
+                title={"연결할 때 이 서버가 알려 준 Galera 클러스터 상태입니다.\n평소 값은 Synced · Primary 입니다."}
+              >
+                Galera {g.clusterSize}대 · {g.localState} · {g.clusterStatus}
+              </span>
+            )}
+          </>
+        ) : (
+          <span className="topo-sub">연결 안 됨</span>
+        )
+      ) : connected && master ? (
         <>
           <div className="topo-item" title="앱이 직접 접속해 마스터임을 확인했습니다. 읽기와 쓰기는 모두 여기로 갑니다.">
             <span className="topo-dot dot-up" />
@@ -1398,11 +1486,54 @@ function ValueView({ selKey, meta, value, showDecoded, setShowDecoded, valErr, r
   );
 }
 
+// ---------------- DBInfoView ----------------
+// What the MariaDB connection reached. Query features land here later.
+function DBInfoView({ info }: Any) {
+  const g = info.galera;
+  const rows: [string, string][] = [
+    ["접속한 서버", info.addr],
+    ["서버 이름", info.hostname],
+    ["버전", info.version],
+    ["계정", info.user],
+    ["기본 데이터베이스", info.database || "(지정 안 함)"],
+    ["쓰기", info.readOnly ? "막힘 — 읽기 전용 프로필이라 이 앱에서는 읽기만 합니다" : "가능 — 프로필에서 읽기 전용을 껐습니다"],
+  ];
+  if (info.serverReadOnly) rows.push(["서버 설정", "read_only 켜짐 (서버 자체가 쓰기를 막고 있음)"]);
+  if (g) {
+    rows.push(["Galera 클러스터", `${g.clusterName || "-"} · ${g.clusterSize}대 · ${g.clusterStatus}`]);
+    rows.push(["이 서버 상태", `${g.nodeName || "-"} · ${g.localState}${g.ready ? "" : " · 요청 받을 준비 안 됨"}`]);
+  }
+  rows.push(["연결 시각", new Date(info.connectedAt).toLocaleString()]);
+  return (
+    <div className="col-scroll">
+      <div className="panel">
+        <table className="kv-table">
+          <tbody>
+            {rows.map(([k, v]) => (
+              <tr key={k}><td className="k">{k}</td><td className="v mono">{v}</td></tr>
+            ))}
+          </tbody>
+        </table>
+        {(info.skipped ?? []).length > 0 && (
+          <div className="hint-text">
+            앞 순서의 서버는 응답하지 않아 건너뛰었습니다:
+            {info.skipped.map((s: string, i: number) => (
+              <div key={i} className="mono" style={{ fontSize: 11 }}>· {s}</div>
+            ))}
+          </div>
+        )}
+        <div className="hint-text">MariaDB 는 지금 연결만 됩니다. 조회 기능은 이어서 추가됩니다.</div>
+      </div>
+    </div>
+  );
+}
+
 // ---------------- ProfileModal ----------------
 // Raw-string local state (parsed on save) so typing spaces/commas in the
 // node/alias fields never gets clobbered by a round-trip through the array form.
 function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
   const p: Profile = initial;
+  const [kind, setKind] = useState(p.kind === "mariadb" ? "mariadb" : "redis");
   const [name, setName] = useState(p.name);
   const [nodesText, setNodesText] = useState((p.nodes || []).join(", "));
   const [redisPort, setRedisPort] = useState(String(p.redisPort || 5000));
@@ -1416,11 +1547,36 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
       .join("\n")
   );
   const [readOnly, setReadOnly] = useState(!!p.readOnly);
+  const [dbPort, setDbPort] = useState(String(p.dbPort || 3306));
+  const [dbUser, setDbUser] = useState(p.dbUser || "");
+  const [database, setDatabase] = useState(p.database || "");
 
   function submit() {
     const nodes = nodesText.split(/[\s,]+/).filter(Boolean);
     if (!name.trim()) {
       alert("이름을 입력하세요.");
+      return;
+    }
+    if (kind === "mariadb") {
+      if (nodes.length === 0) {
+        alert("MariaDB 서버 IP 를 입력하세요.");
+        return;
+      }
+      if (!dbUser.trim()) {
+        alert("사용자를 입력하세요.");
+        return;
+      }
+      onSave({
+        ...p,
+        kind,
+        name: name.trim(),
+        nodes,
+        dbPort: parseInt(dbPort || "0", 10) || 3306,
+        dbUser: dbUser.trim(),
+        database: database.trim(),
+        password,
+        readOnly,
+      });
       return;
     }
     if (nodes.length === 0) {
@@ -1438,6 +1594,7 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
     });
     onSave({
       ...p,
+      kind,
       name: name.trim(),
       nodes,
       redisPort: parseInt(redisPort || "0", 10) || 5000,
@@ -1459,6 +1616,47 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
         </div>
         <div className="modal-body">
           <div className="form-grid" style={{ padding: 0 }}>
+            {p.id ? (
+              <div className="hint-text">종류: {kind === "mariadb" ? "MariaDB" : "Redis-Sentinel"}</div>
+            ) : (
+              <div className="kind-pick">
+                <span>종류</span>
+                <button className={"btn btn-xs" + (kind === "redis" ? " btn-primary" : "")} onClick={() => setKind("redis")}>
+                  Redis-Sentinel
+                </button>
+                <button className={"btn btn-xs" + (kind === "mariadb" ? " btn-primary" : "")} onClick={() => setKind("mariadb")}>
+                  MariaDB
+                </button>
+              </div>
+            )}
+            {kind === "mariadb" ? (
+              <>
+                <div className="hint-text">MariaDB 에 연결합니다. * 는 꼭 넣어야 하는 칸입니다.</div>
+                <label>이름 *<input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: liz 운영 DB" /></label>
+                <label>
+                  MariaDB 서버 IP * (여러 개면 쉼표로 — 앞에서부터 접속해 보고 응답하는 서버에 붙어요)
+                  <input
+                    className="mono"
+                    value={nodesText}
+                    onChange={(e) => setNodesText(e.target.value)}
+                    placeholder="예: 172.17.64.133"
+                  />
+                </label>
+                <div className="row2">
+                  <label>포트 (기본 3306)<input value={dbPort} onChange={(e) => setDbPort(e.target.value)} /></label>
+                  <label>데이터베이스 (비워도 됨 — Liz 는 liz)<input className="mono" value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="liz" /></label>
+                </div>
+                <div className="row2">
+                  <label>사용자 *<input className="mono" value={dbUser} onChange={(e) => setDbUser(e.target.value)} placeholder="예: root" /></label>
+                  <label>비밀번호<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+                </div>
+                <label className="chk">
+                  <input type="checkbox" checked={readOnly} onChange={(e) => setReadOnly(e.target.checked)} />
+                  읽기 전용 (이 앱이 보내는 문장은 쓰기가 막힘 — 기본 켜짐)
+                </label>
+              </>
+            ) : (
+            <>
             <div className="hint-text">Sentinel 구성(Liz 표준)에 연결합니다. * 는 꼭 넣어야 하는 칸입니다.</div>
             <label>이름 *<input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: liz 운영" /></label>
             <label>
@@ -1485,6 +1683,8 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
               <input type="checkbox" checked={readOnly} onChange={(e) => setReadOnly(e.target.checked)} />
               읽기 전용 (쓰기 탭 잠금 — 기본 켜짐)
             </label>
+            </>
+            )}
           </div>
         </div>
         <div className="modal-foot">

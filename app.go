@@ -10,6 +10,7 @@ import (
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"redis-client/internal/mdb"
 	"redis-client/internal/profile"
 	"redis-client/internal/rc"
 	"redis-client/internal/topo"
@@ -22,6 +23,7 @@ type App struct {
 	ctx      context.Context
 	profiles *profile.Store
 	mgr      *rc.Manager
+	db       *mdb.Manager
 	updater  *updater.Updater
 
 	// version is set from main() after NewApp(); the updater is built lazily on
@@ -39,6 +41,7 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.profiles = store
 	a.mgr = rc.NewManager(a.emit)
+	a.db = mdb.NewManager()
 
 	if a.version == "" {
 		a.version = "dev"
@@ -76,6 +79,9 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.mgr != nil {
 		a.mgr.CloseAll()
 	}
+	if a.db != nil {
+		a.db.CloseAll()
+	}
 }
 
 func (a *App) emit(event string, data interface{}) {
@@ -109,8 +115,8 @@ func (a *App) SaveProfile(p profile.Profile) (profile.Profile, error) {
 		return saved, err
 	}
 	// drop any live connection so the next Connect uses the updated config
-	if saved.ID != "" && a.mgr != nil {
-		a.mgr.Disconnect(saved.ID)
+	if saved.ID != "" {
+		a.Disconnect(saved.ID)
 	}
 	return saved, nil
 }
@@ -119,9 +125,7 @@ func (a *App) DeleteProfile(id string) error {
 	if a.profiles == nil {
 		return fmt.Errorf("profile store not initialized")
 	}
-	if a.mgr != nil {
-		a.mgr.Disconnect(id)
-	}
+	a.Disconnect(id)
 	return a.profiles.Delete(id)
 }
 
@@ -135,6 +139,9 @@ func (a *App) Connect(profileID string) (topo.Topology, error) {
 	p, err := a.profiles.Get(profileID)
 	if err != nil {
 		return topo.Topology{}, err
+	}
+	if p.IsMariaDB() {
+		return topo.Topology{}, fmt.Errorf("MariaDB 프로필입니다")
 	}
 	t, err := a.mgr.Connect(a.ctx, p)
 	if err == nil && len(t.FoundNodes) > 0 {
@@ -169,10 +176,33 @@ func (a *App) Disconnect(profileID string) {
 	if a.mgr != nil {
 		a.mgr.Disconnect(profileID)
 	}
+	if a.db != nil {
+		a.db.Disconnect(profileID)
+	}
 }
 
 func (a *App) IsConnected(profileID string) bool {
-	return a.mgr != nil && a.mgr.IsConnected(profileID)
+	return (a.mgr != nil && a.mgr.IsConnected(profileID)) ||
+		(a.db != nil && a.db.IsConnected(profileID))
+}
+
+// ---- MariaDB connection ----
+
+// ConnectDB connects a MariaDB profile, trying its server IPs in order.
+func (a *App) ConnectDB(profileID string) (mdb.Info, error) {
+	p, err := a.profiles.Get(profileID)
+	if err != nil {
+		return mdb.Info{}, err
+	}
+	if !p.IsMariaDB() {
+		return mdb.Info{}, fmt.Errorf("MariaDB 프로필이 아닙니다")
+	}
+	return a.db.Connect(a.ctx, p)
+}
+
+// GetDBInfo returns what ConnectDB reported for a live MariaDB connection.
+func (a *App) GetDBInfo(profileID string) (mdb.Info, error) {
+	return a.db.Info(profileID)
 }
 
 func (a *App) GetTopology(profileID string) (topo.Topology, error) {
