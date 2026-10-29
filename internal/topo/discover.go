@@ -75,8 +75,9 @@ type RedisNode struct {
 
 // SentinelNode is a sentinel instance we know about.
 type SentinelNode struct {
-	Addr string `json:"addr"`
-	Up   bool   `json:"up"`
+	Addr   string `json:"addr"`
+	Up     bool   `json:"up"`
+	Source string `json:"source"` // "profile" (a profile node) | "announced" (reported by a sentinel)
 }
 
 // Topology is the full picture handed to the UI.
@@ -120,6 +121,10 @@ func Discover(ctx context.Context, cfg Config) Topology {
 	// --- 1. Sentinel pass: ping each node's sentinel, and from the first
 	// reachable one pull master addr, quorum, and the sentinel roster. ---
 	sentinelSeen := map[string]bool{}
+	profileSentinel := map[string]bool{} // addresses typed into the profile, vs. ones a sentinel told us about
+	for _, node := range cfg.Nodes {
+		profileSentinel[net.JoinHostPort(node, strconv.Itoa(cfg.SentinelPort))] = true
+	}
 	var sentinelMaster string // rewritten to IP
 	discovered := false
 	for _, node := range cfg.Nodes {
@@ -129,7 +134,7 @@ func Discover(ctx context.Context, cfg Config) Topology {
 		}
 		sentinelSeen[saddr] = true
 		up := ping(ctx, saddr, cfg.SentinelPassword, cfg.Timeout)
-		t.Sentinels = append(t.Sentinels, SentinelNode{Addr: saddr, Up: up})
+		t.Sentinels = append(t.Sentinels, SentinelNode{Addr: saddr, Up: up, Source: "profile"})
 		if up && !discovered {
 			if m, q, others, ok := sentinelDiscover(ctx, saddr, cfg, aliases); ok {
 				sentinelMaster = m
@@ -137,11 +142,11 @@ func Discover(ctx context.Context, cfg Config) Topology {
 				discovered = true
 				// merge sentinel-reported peers (may live on hosts not in Nodes)
 				for _, o := range others {
-					if !sentinelSeen[o] {
+					if !sentinelSeen[o] && !profileSentinel[o] { // profile nodes are probed by this loop itself
 						sentinelSeen[o] = true
 						_, unresolved := unresolvedHost(o) // a bare name can't be dialed from here
 						t.Sentinels = append(t.Sentinels, SentinelNode{
-							Addr: o, Up: !unresolved && ping(ctx, o, cfg.SentinelPassword, cfg.Timeout),
+							Addr: o, Up: !unresolved && ping(ctx, o, cfg.SentinelPassword, cfg.Timeout), Source: "announced",
 						})
 					}
 				}
@@ -166,7 +171,7 @@ func Discover(ctx context.Context, cfg Config) Topology {
 			t.Source = "sentinel+probe"
 			if sentinelMaster != "" && !sameHostPort(sentinelMaster, probeMaster.Addr) {
 				t.Warnings = append(t.Warnings,
-					"sentinel reports master "+sentinelMaster+" but INFO says master is "+probeMaster.Addr+" (failover in progress?)")
+					"Sentinel 은 마스터를 "+sentinelMaster+" 로, 노드 직접 확인은 "+probeMaster.Addr+" 로 봅니다 (페일오버 중일 수 있음)")
 			}
 		} else {
 			t.Source = "direct-probe"
@@ -183,11 +188,11 @@ func Discover(ctx context.Context, cfg Config) Topology {
 					"Sentinel 이 마스터를 %q 라는 이름으로 알려 줬는데 IP 를 몰라 확인하지 못했습니다 — 노드 목록에 그 서버 IP 를 넣거나 별칭에 %s=<IP> 를 넣으세요",
 					host, host))
 			} else {
-				t.Warnings = append(t.Warnings, "sentinel master "+sentinelMaster+" did not verify as role:master")
+				t.Warnings = append(t.Warnings, "Sentinel 이 알려 준 마스터 "+sentinelMaster+" 에 접속해 마스터인지 확인하지 못했습니다")
 			}
 		}
 	default:
-		t.Warnings = append(t.Warnings, "no master found: no reachable sentinel and no node reports role:master")
+		t.Warnings = append(t.Warnings, "마스터를 찾지 못했습니다 — 응답한 Sentinel 이 없고, 마스터라고 답한 Redis 도 없습니다")
 	}
 
 	t.Warnings = append(t.Warnings, unresolvedWarnings(t)...)

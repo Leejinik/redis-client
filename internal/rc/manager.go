@@ -141,7 +141,7 @@ func (m *Manager) Connect(ctx context.Context, p profile.Profile) (topo.Topology
 
 	t := topo.Discover(ctx, cfg)
 	if t.Master == nil {
-		msg := "no master found"
+		msg := "마스터를 찾지 못했습니다"
 		if len(t.Warnings) > 0 {
 			msg = strings.Join(t.Warnings, "; ")
 		}

@@ -99,8 +99,9 @@ func DecodeString(key, val string) *Decoded {
 }
 
 // DecodeHash groups a `device:*` hash into a "core" table plus one table per
-// interface (fields like `interface.0.status` -> group "interface 0", field
-// "status"). Returns nil for non-device hashes.
+// interface (fields like `interface.0.status` -> group "interface 0"). Fields
+// keep their full stored name so what the user reads is what HSET must use.
+// Returns nil for non-device hashes.
 func DecodeHash(key string, kvs []KV) *Decoded {
 	if !strings.HasPrefix(key, "device:") {
 		return nil
@@ -120,7 +121,7 @@ func DecodeHash(key string, kvs []KV) *Decoded {
 					ifaces[name] = g
 					order = append(order, name)
 				}
-				g.Fields = append(g.Fields, statusLabeled(KV{Field: sub, Value: kv.Value}, sub == "status"))
+				g.Fields = append(g.Fields, statusLabeled(kv, sub == "status"))
 				continue
 			}
 		}

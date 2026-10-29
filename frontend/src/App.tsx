@@ -12,6 +12,7 @@ import {
   KeyMeta,
   ReadValue,
   MGetRange,
+  MGet,
   Write,
   AutoUpdate,
   CheckForUpdate,
@@ -62,20 +63,83 @@ function typeClass(t: string): string {
   return "type-" + (t || "none");
 }
 
-// severity color for a decoded status-code name (status-codes.md)
-function statusColor(name: string): string {
-  switch (name) {
-    case "CONNECTED":
-      return "st-ok";
-    case "NOT_VERIFIED":
-      return "st-idle";
-    case "RECONNECTING":
-    case "CONNECTING":
-    case "RESPONSE_DELAY":
-      return "st-warn";
-    default:
-      return "st-bad"; // DISCONNECTED, PROTOCOL_ERROR, OFFLINE, STOPPED_*
-  }
+// STATUS_TABLE is the status-code list the app decodes with (Liz dev
+// status-codes.md). Labels stay neutral grey: which codes count as "bad" in the
+// product hasn't been confirmed, so the app must not paint a verdict.
+const STATUS_TABLE =
+  "앱에 넣은 상태 코드표 (Liz 개발 status-codes.md)\n" +
+  "0 NOT_VERIFIED · 1 DISCONNECTED · 2 CONNECTED · 3 RECONNECTING\n" +
+  "4 PROTOCOL_ERROR · 5 CONNECTING · 6 OFFLINE · 7 STOPPED_POINT_NOT_DEFINED\n" +
+  "8 STOPPED_MONITOR_STOPPED · 9 STOPPED_DISABLED · 10 RESPONSE_DELAY\n" +
+  "제품 화면의 한국어 표기·정상 여부는 아직 확인 전입니다.";
+
+// checkpoint value parts: stable backend keys -> on-screen names (same names in
+// the value tab and the range table).
+const CP_LABEL: Record<string, string> = { id: "번호", formatted: "표시값", timestamp: "시각", raw: "원래값" };
+
+// tzLabel renders this PC's UTC offset, e.g. "UTC+09:00". Decoded times use the
+// PC's zone, not the server's.
+function tzLabel(): string {
+  const off = -new Date().getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  const a = Math.abs(off);
+  return `UTC${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+}
+
+// msTime turns a 13-digit epoch-ms string into local time, or "" when it isn't one.
+function msTime(v: string): string {
+  if (!/^1\d{12}$/.test((v || "").trim())) return "";
+  const d = new Date(parseInt(v, 10));
+  const z = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}.${z(d.getMilliseconds(), 3)}`;
+}
+
+function clockNow(d: Date): string {
+  const z = (n: number) => String(n).padStart(2, "0");
+  return `${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}`;
+}
+
+// lengthLabel says what `length` counts for each type.
+function lengthLabel(type: string, n: number): string {
+  if (type === "string") return `길이 ${n}바이트`;
+  if (type === "hash") return `필드 ${n}개`;
+  return `원소 ${n}개`;
+}
+
+function hasGlob(s: string): boolean {
+  return /[*?[]/.test(s);
+}
+
+function short(s: string, n = 120): string {
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// summarizeConnErr turns the joined Go/redis error text into one Korean line per
+// cause; the original stays available under "오류 원문 보기".
+function summarizeConnErr(raw: string): string[] {
+  const out: string[] = [];
+  const add = (s: string) => {
+    if (!out.includes(s)) out.push(s);
+  };
+  // With a wrong password every probe fails, so the "couldn't verify the master"
+  // follow-on line only misleads (the master is fine) — show the cause alone.
+  const authFail = /WRONGPASS|invalid password|NOAUTH/i.test(raw);
+  raw
+    .replace(/^Error: /, "")
+    .replace(/^connect failed: /, "")
+    .split("; ")
+    .forEach((part) => {
+      const m = part.match(/^redis ([^ ]+): (.*)$/);
+      const who = m ? m[1] : "";
+      const why = m ? m[2] : part;
+      if (/no such host/i.test(why)) add(`${who} — 이 이름의 서버를 찾을 수 없습니다`);
+      else if (/WRONGPASS|invalid password|NOAUTH/i.test(why)) add("Redis 비밀번호가 틀렸습니다");
+      else if (/refused/i.test(why)) add(`${who} — 연결을 거부했습니다 (포트가 닫혀 있거나 Redis 가 꺼져 있음)`);
+      else if (/deadline exceeded|timeout/i.test(why)) add(`${who} — 응답이 없습니다 (시간 초과)`);
+      else if (authFail && /마스터인지 확인하지 못했습니다|마스터를 찾지 못했습니다/.test(why)) return;
+      else add(why);
+    });
+  return out;
 }
 
 function fmtBytes(n: number): string {
@@ -93,9 +157,9 @@ function missingLabel(it: Any): string {
 }
 
 function fmtTTL(s: number): string {
-  if (s === -1) return "no expire";
-  if (s === -2) return "missing";
-  return s + "s";
+  if (s === -1) return "만료 없음";
+  if (s === -2) return "키 없음";
+  return `${s}초 뒤 만료`;
 }
 
 export default function App() {
@@ -119,6 +183,7 @@ export default function App() {
   const [cursor, setCursor] = useState(0);
   const [scanDone, setScanDone] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [pendingScan, setPendingScan] = useState(false); // run a fresh scan once `match` has updated
   const listRef = useRef<HTMLDivElement>(null);
   const scanGen = useRef(0); // bumped on every scan; stale async results are dropped
   const scanBusy = useRef(false); // single-flight lock for auto-continuations
@@ -130,6 +195,7 @@ export default function App() {
   const [value, setValue] = useState<Any>(null);
   const [showDecoded, setShowDecoded] = useState(true);
   const [valErr, setValErr] = useState("");
+  const [valReadAt, setValReadAt] = useState<Date | null>(null);
 
   // range
   const [rPrefix, setRPrefix] = useState("checkpoint:");
@@ -147,12 +213,24 @@ export default function App() {
   const [wFields, setWFields] = useState("");
   const [wResults, setWResults] = useState<Any[]>([]);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [preview, setPreview] = useState<{ rows: Any[]; notes: string[]; at: Date } | null>(null);
   const [wErr, setWErr] = useState("");
 
   const selProfile = useMemo(
     () => profiles.find((p) => p.id === selId) || null,
     [profiles, selId]
   );
+
+  // Esc closes the topmost dialog (write confirm first, then the profile form).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (confirmOpen) setConfirmOpen(false);
+      else if (form) setForm(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmOpen, form]);
 
   // ---- load + events ----
   async function loadProfiles() {
@@ -347,6 +425,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keys, scanDone, scanning, connected]);
 
+  useEffect(() => {
+    if (pendingScan) {
+      setPendingScan(false);
+      scan(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingScan]);
+
   function onListScroll() {
     const el = listRef.current;
     if (!el) return;
@@ -366,6 +452,7 @@ export default function App() {
       ]);
       setMeta(m);
       setValue(v);
+      setValReadAt(new Date());
     } catch (e: Any) {
       setValErr(String(e));
     }
@@ -429,11 +516,75 @@ export default function App() {
     return "";
   }
 
-  function openConfirm() {
+  // buildPreview reads what is there now so the confirm dialog can show
+  // "지금 값 → 바꿀 내용" instead of a JSON dump. HSET sends the field name
+  // exactly as typed, so a name that isn't in the hash is called out.
+  async function buildPreview(): Promise<{ rows: Any[]; notes: string[]; at: Date }> {
+    const op = buildOps()[0];
+    const rows: Any[] = [];
+    const notes: string[] = [];
+    const cur = (it: Any) =>
+      !it || !it.exists
+        ? it && it.type && it.type !== "none"
+          ? `(${it.type} 키 — 문자열로 덮어씀)`
+          : "(없음 · 새로 생김)"
+        : short(it.value);
+    if (op.op === "set") {
+      const [it] = (await MGet(selId, [op.key])) as Any;
+      rows.push({ key: op.key, now: cur(it), next: short(op.value), ttl: op.ttlSeconds > 0 ? `${op.ttlSeconds}초 뒤 만료` : "만료 없음" });
+      if (it && !it.exists && it.type && it.type !== "none")
+        notes.push(`⚠ ${op.key} 는 ${it.type} 키입니다 — SET 하면 기존 값이 사라지고 문자열 키로 바뀝니다.`);
+    } else if (op.op === "mset") {
+      const ks = Object.keys(op.fields);
+      const its = (await MGet(selId, ks)) as Any[];
+      ks.forEach((k, i) => rows.push({ key: k, now: cur(its[i]), next: short(op.fields[k]), ttl: "만료 없음" }));
+    } else if (op.op === "hset") {
+      const v = (await ReadValue(selId, op.key)) as Any;
+      if (!v.exists) notes.push(`${op.key} 키가 없어 새 해시가 생깁니다.`);
+      else if (v.type !== "hash") notes.push(`⚠ ${op.key} 는 ${v.type} 키라 HSET 이 실패합니다.`);
+      const have: Record<string, string> = {};
+      (v.hash ?? []).forEach((kv: Any) => (have[kv.field] = kv.value));
+      Object.keys(op.fields).forEach((f) => {
+        const exists = f in have;
+        rows.push({ key: op.key, field: f, now: exists ? short(have[f]) : "(없음 · 새 필드)", next: short(op.fields[f]) });
+        if (!exists && v.type === "hash") {
+          const similar = Object.keys(have).filter((h) => h !== f && h.split(".").pop() === f.split(".").pop());
+          notes.push(
+            `⚠ 이 해시에 「${f}」 필드는 없습니다 — 입력한 이름 그대로 새 필드가 생깁니다.` +
+              (similar.length
+                ? ` 비슷한 기존 필드: ${similar.slice(0, 3).map((h) => `${h} (지금 값 ${short(have[h], 30)})`).join(", ")}. 그 필드를 바꾸려면 취소하고 필드 이름을 고치세요.`
+                : "")
+          );
+        }
+      });
+    } else if (op.op === "expire") {
+      const m = (await KeyMeta(selId, op.key)) as Any;
+      if (!m.exists) notes.push(`${op.key} 키가 없어 아무 일도 일어나지 않습니다.`);
+      const when = clockNow(new Date(Date.now() + op.ttlSeconds * 1000));
+      rows.push({ key: op.key, now: m.exists ? fmtTTL(m.ttlSeconds) : "(없음)", next: `${op.ttlSeconds}초 뒤 만료 — ${when} 무렵 키가 지워짐` });
+    } else if (op.op === "del") {
+      const m = (await KeyMeta(selId, op.key)) as Any;
+      rows.push({
+        key: op.key,
+        now: m.exists ? `${m.type} · ${lengthLabel(m.type, m.length)}` : "(없음)",
+        next: m.exists ? "삭제 — 되돌릴 수 없습니다" : "(지울 키 없음)",
+      });
+    }
+    return { rows, notes, at: new Date() };
+  }
+
+  async function openConfirm() {
     const p = writeProblem();
     setWErr(p);
     setWResults([]);
-    if (!p) setConfirmOpen(true);
+    if (p) return;
+    setPreview(null);
+    setConfirmOpen(true);
+    try {
+      setPreview(await buildPreview());
+    } catch (e: Any) {
+      setPreview({ rows: [], notes: ["지금 값을 읽지 못했습니다: " + String(e)], at: new Date() });
+    }
   }
 
   function buildOps(): Any[] {
@@ -528,7 +679,7 @@ export default function App() {
                 <div className="pname">{p.name}</div>
                 <div className="pmeta mono">
                   {p.nodes.join(", ")} · {p.masterName}
-                  {p.readOnly ? " · RO" : " · RW"}
+                  {p.readOnly ? " · 읽기 전용" : " · 쓰기 가능"}
                 </div>
               </div>
             ))}
@@ -555,7 +706,18 @@ export default function App() {
               )}
             </div>
           )}
-          {connErr && <div className="err-text">{connErr}</div>}
+          {connErr && (
+            <div className="err-text">
+              연결하지 못했습니다.
+              {summarizeConnErr(connErr).map((s, i) => (
+                <div key={i}>· {s}</div>
+              ))}
+              <details style={{ marginTop: 6 }}>
+                <summary>오류 원문 보기</summary>
+                <div className="mono" style={{ fontSize: 11 }}>{connErr}</div>
+              </details>
+            </div>
+          )}
         </div>
 
         {/* ---- middle: key browser ---- */}
@@ -563,21 +725,23 @@ export default function App() {
           <div className="col-head">
             <span className="grow">키 브라우저</span>
             {connected && (
-              <span className="topo-sub">{keys.length} loaded{scanDone ? " (끝)" : ""}</span>
+              <span className="topo-sub">불러온 키 {keys.length.toLocaleString()}개 · {scanDone ? "끝" : "더 있음"}</span>
             )}
           </div>
           {connected ? (
             <>
               <div className="scan-controls">
                 <input
-                  placeholder="MATCH 패턴 (예: checkpoint:*, device:*, 빈칸=전체)"
+                  placeholder="키 이름 찾기 (예: device:*, 빈칸=전체)"
                   value={match}
                   onChange={(e) => setMatch(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && scan(true)}
                   className="mono"
                 />
-                <button className="btn" disabled={scanning} onClick={() => scan(true)}>스캔</button>
+                <button className="btn" disabled={scanning} onClick={() => scan(true)}>찾기</button>
               </div>
+              {/* always shown: hiding it on blur shifted the list up under the pointer mid-click */}
+              <div className="hint-line">* 아무 글자 · ? 한 글자 · [abc] 중 하나 · 기호가 없으면 그 이름의 키 하나만</div>
               <div className="col-scroll" ref={listRef} onScroll={onListScroll}>
                 {keys.map((k) => (
                   <div
@@ -591,11 +755,35 @@ export default function App() {
                 ))}
                 {keys.length === 0 && !scanning && (
                   <div className="empty">
-                    {scanDone ? "일치하는 키가 없습니다." : "스캔을 눌러 키를 조회하세요."}
+                    {!scanDone ? (
+                      "찾기를 눌러 키를 불러오세요."
+                    ) : match.trim() && !hasGlob(match) ? (
+                      <>
+                        「{match.trim()}」 키가 없습니다.
+                        <br />
+                        <button
+                          className="btn btn-xs"
+                          style={{ marginTop: 8 }}
+                          onClick={() => {
+                            setMatch(match.trim() + "*");
+                            setPendingScan(true);
+                          }}
+                        >
+                          {match.trim()}* 로 찾기
+                        </button>
+                      </>
+                    ) : (
+                      "찾는 패턴과 맞는 키가 없습니다."
+                    )}
                   </div>
                 )}
                 {scanning && <div className="load-more dim">불러오는 중…</div>}
-                {scanDone && keys.length > 0 && <div className="load-more dim">— 끝 —</div>}
+                {!scanning && !scanDone && keys.length > 0 && (
+                  <div className="load-more dim">── 스크롤하면 다음 키를 불러옵니다 ──</div>
+                )}
+                {scanDone && keys.length > 0 && (
+                  <div className="load-more dim">── 끝 ({keys.length.toLocaleString()}개) ──</div>
+                )}
               </div>
             </>
           ) : (
@@ -609,7 +797,15 @@ export default function App() {
             <div className="tabs">
               <button className={"tab" + (tab === "value" ? " active" : "")} onClick={() => setTab("value")}>값</button>
               <button className={"tab" + (tab === "range" ? " active" : "")} onClick={() => setTab("range")}>범위 조회</button>
-              <button className={"tab" + (tab === "write" ? " active" : "")} onClick={() => setTab("write")}>쓰기</button>
+              <button
+                className={"tab" + (tab === "write" ? " active" : "")}
+                onClick={() => {
+                  if (!wKey && selKey) setWKey(selKey);
+                  setTab("write");
+                }}
+              >
+                쓰기
+              </button>
             </div>
           </div>
 
@@ -621,6 +817,10 @@ export default function App() {
               showDecoded={showDecoded}
               setShowDecoded={setShowDecoded}
               valErr={valErr}
+              readAt={valReadAt}
+              connected={connected}
+              masterAddr={topo?.master?.addr || ""}
+              onRefresh={() => openKey(selKey)}
             />
           )}
 
@@ -628,12 +828,18 @@ export default function App() {
             <div className="col-scroll">
               <div className="panel">
                 <div className="inline">
-                  <label>접두어<input className="mono" value={rPrefix} onChange={(e) => setRPrefix(e.target.value)} /></label>
-                  <label>from<input style={{ width: 100 }} value={rFrom} onChange={(e) => setRFrom(e.target.value)} /></label>
-                  <label>to<input style={{ width: 100 }} value={rTo} onChange={(e) => setRTo(e.target.value)} /></label>
-                  <button className="btn btn-primary" disabled={!connected} onClick={runRange}>MGET</button>
+                  <label>키 앞부분<input className="mono" value={rPrefix} onChange={(e) => setRPrefix(e.target.value)} /></label>
+                  <label>시작 번호<input style={{ width: 100 }} value={rFrom} onChange={(e) => setRFrom(e.target.value)} onKeyDown={(e) => e.key === "Enter" && runRange()} /></label>
+                  <label>끝 번호 (포함)<input style={{ width: 100 }} value={rTo} onChange={(e) => setRTo(e.target.value)} onKeyDown={(e) => e.key === "Enter" && runRange()} /></label>
+                  <button className="btn btn-primary" disabled={!connected} onClick={runRange}>가져오기</button>
                 </div>
-                <div className="hint-text">키 이름 = 접두어 + 숫자(from~to, 양 끝 포함). 문자열(string) 키만 읽습니다 — hash 등은 값 탭에서 보세요.</div>
+                {(() => {
+                  const a = rFrom.trim(), b = rTo.trim();
+                  if (!/^\d+$/.test(a) || !/^\d+$/.test(b)) return null;
+                  const lo = Math.min(+a, +b), hi = Math.max(+a, +b);
+                  return <div className="hint-line mono">→ {rPrefix}{lo} ~ {rPrefix}{hi} · 키 {(hi - lo + 1).toLocaleString()}개</div>;
+                })()}
+                <div className="hint-text">문자열(string) 키만 읽습니다 — hash 등은 값 탭에서 보세요.</div>
                 {rErr && <div className="err-text">{rErr}</div>}
                 {rItems.length > 0 && (() => {
                   // decoded.fields를 한 번만 펼쳐 정상/전치 뷰가 공유
@@ -645,34 +851,31 @@ export default function App() {
                   // 전치 뷰의 행 정의: [필드명, 값 접근자, 셀 클래스, 아웃라이어 하이라이트 여부]
                   // id·raw는 열마다 고유하므로 하이라이트 대상 아님(전체가 튀어 노이즈).
                   const fieldDefs: [string, (r: Any) => string, string, boolean][] = [
-                    ["id", (r) => r.f.id ?? "", "", false],
+                    ["번호", (r) => r.f.id ?? "", "", false],
                     ["표시값", (r) => r.f.formatted ?? "", "", true],
                     ["시각", (r) => r.f.timestamp ?? "", "mono", true],
-                    ["원값", (r) => r.f.raw ?? "", "", true],
-                    ["raw", (r) => (r.it.exists ? r.it.value : missingLabel(r.it)), "mono", false],
+                    ["원래값", (r) => r.f.raw ?? "", "", true],
+                    ["저장된 그대로", (r) => (r.it.exists ? r.it.value : missingLabel(r.it)), "mono", false],
                   ];
                   return (
                     <>
                       <div className="inline" style={{ marginTop: 4 }}>
                         <button className="btn btn-xs" onClick={() => setRPivot((p) => !p)}>
-                          ⇄ 전치 {rPivot ? "해제" : ""}(Tab)
+                          ⇄ 행·열 바꾸기
                         </button>
-                        <span className="hint-text">표에 포커스 후 Tab으로 행/열 전환 · {rItems.length}건</span>
+                        {rPivot && (
+                          <span className="hint-text">
+                            <span className="cell-diff legend-swatch" /> 첫 번째 키와 다른 값
+                          </span>
+                        )}
+                        <span className="grow" />
+                        <span className="hint-text">{rItems.length}건 · 시각은 이 PC 시간 ({tzLabel()})</span>
                       </div>
-                      <div
-                        style={{ overflow: "auto", outline: "none" }}
-                        tabIndex={0}
-                        onKeyDown={(e) => {
-                          if (e.key === "Tab") {
-                            e.preventDefault();
-                            setRPivot((p) => !p);
-                          }
-                        }}
-                      >
+                      <div style={{ overflow: "auto" }}>
                         {!rPivot ? (
                           <table className="result-table">
                             <thead>
-                              <tr><th>key</th><th>id</th><th>표시값</th><th>시각</th><th>원값</th><th>raw</th></tr>
+                              <tr><th>키</th><th>번호</th><th>표시값</th><th>시각</th><th>원래값</th><th>저장된 그대로</th></tr>
                             </thead>
                             <tbody>
                               {rows.map(({ it, f }: Any) => (
@@ -682,7 +885,7 @@ export default function App() {
                                   <td>{f.formatted ?? ""}</td>
                                   <td className="mono">{f.timestamp ?? ""}</td>
                                   <td>{f.raw ?? ""}</td>
-                                  <td className="mono wrap">{it.exists ? it.value : missingLabel(it)}</td>
+                                  <td className="mono cell-1line" title={it.exists ? it.value : ""}>{it.exists ? it.value : missingLabel(it)}</td>
                                 </tr>
                               ))}
                             </tbody>
@@ -691,7 +894,7 @@ export default function App() {
                           <table className="result-table pivot-table">
                             <thead>
                               <tr>
-                                <th className="rowhead corner">필드</th>
+                                <th className="rowhead corner">항목</th>
                                 {rows.map(({ it, f }: Any) => (
                                   <th
                                     key={it.key}
@@ -747,20 +950,27 @@ export default function App() {
                   <span className={"badge " + (readOnly ? "badge-ro" : "badge-rw")}>
                     {readOnly ? "읽기 전용" : "쓰기 가능"}
                   </span>
-                  <span className="topo-sub">쓰기는 마스터로만 전송됩니다. 읽기전용은 프로필 수정에서 끕니다.</span>
+                  <span className="topo-sub">읽기·쓰기 모두 마스터 {topo?.master?.addr || "?"} 로 갑니다. 읽기 전용은 프로필 수정에서 끕니다.</span>
                 </div>
                 <label>
                   작업
-                  <select value={wOp} onChange={(e) => setWOp(e.target.value)}>
-                    <option value="set">SET (문자열)</option>
-                    <option value="hset">HSET (해시 필드)</option>
-                    <option value="mset">MSET (여러 키 배치)</option>
-                    <option value="expire">EXPIRE (TTL 설정)</option>
-                    <option value="del">DEL (삭제)</option>
+                  <select
+                    value={wOp}
+                    onChange={(e) => {
+                      setWOp(e.target.value);
+                      setWResults([]);
+                      setWErr("");
+                    }}
+                  >
+                    <option value="set">SET — 문자열 키 하나 쓰기</option>
+                    <option value="hset">HSET — 해시 키의 필드 쓰기</option>
+                    <option value="mset">MSET — 문자열 키 여러 개 한 번에 쓰기</option>
+                    <option value="expire">EXPIRE — 키에 만료 시간 걸기 (지나면 키가 지워짐)</option>
+                    <option value="del">DEL — 키 지우기</option>
                   </select>
                 </label>
                 {wOp !== "mset" && (
-                  <label>키<input className="mono" value={wKey} onChange={(e) => setWKey(e.target.value)} placeholder="checkpoint:__rc_test__" /></label>
+                  <label>키<input className="mono" value={wKey} onChange={(e) => setWKey(e.target.value)} placeholder="키 이름 (값 탭에서 고른 키가 자동으로 들어옵니다)" /></label>
                 )}
                 {wOp === "set" && (
                   <label>값<input className="mono" value={wValue} onChange={(e) => setWValue(e.target.value)} /></label>
@@ -773,7 +983,7 @@ export default function App() {
                 )}
                 {(wOp === "hset" || wOp === "mset") && (
                   <label>
-                    {wOp === "hset" ? "필드 (field=value, 한 줄에 하나)" : "키/값 (key=value, 한 줄에 하나)"}
+                    {wOp === "hset" ? "필드 (Redis 에 저장할 이름 그대로 — field=value, 한 줄에 하나)" : "키/값 (key=value, 한 줄에 하나)"}
                     <textarea rows={5} className="mono" value={wFields} onChange={(e) => setWFields(e.target.value)} />
                   </label>
                 )}
@@ -814,15 +1024,53 @@ export default function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head"><span className="grow">쓰기 확인</span></div>
             <div className="modal-body">
-              <div className="confirm-line">운영 중인 마스터에 다음을 실행합니다:</div>
-              <div className="confirm-box mono">{JSON.stringify(buildOps(), null, 2)}</div>
-              <div className="confirm-line" style={{ color: "#ffd29b", marginTop: 10 }}>
-                마스터: {topo?.master?.addr || "?"}
+              <div className="confirm-line">
+                운영 중인 마스터 <b className="mono">{topo?.master?.addr || "?"}</b> 에 다음을 실행합니다.
               </div>
+              {!preview ? (
+                <div className="hint-text">지금 값을 읽는 중…</div>
+              ) : (
+                <>
+                  {preview.rows.length > 0 && (
+                    <table className="result-table confirm-table">
+                      <thead>
+                        <tr>
+                          <th>키</th>
+                          {wOp === "hset" && <th>필드</th>}
+                          <th>지금</th>
+                          <th>→ 바뀔 내용</th>
+                          {(wOp === "set" || wOp === "mset") && <th>만료</th>}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.rows.map((r: Any, i: number) => (
+                          <tr key={i}>
+                            <td className="mono">{r.key}</td>
+                            {wOp === "hset" && <td className="mono">{r.field}</td>}
+                            <td className="mono">{r.now}</td>
+                            <td className="mono">{r.next}</td>
+                            {(wOp === "set" || wOp === "mset") && <td>{r.ttl}</td>}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {preview.notes.map((n, i) => (
+                    <div key={i} className="warn-text">{n}</div>
+                  ))}
+                  <div className="hint-text">「지금」은 {clockNow(preview.at)} 에 읽은 값입니다.</div>
+                </>
+              )}
+              <details style={{ marginTop: 8 }}>
+                <summary className="hint-text">전송 내용 자세히 보기</summary>
+                <div className="confirm-box mono">{JSON.stringify(buildOps(), null, 2)}</div>
+              </details>
             </div>
             <div className="modal-foot">
-              <button className="btn" onClick={() => setConfirmOpen(false)}>취소</button>
-              <button className="btn btn-danger" onClick={confirmWrite}>실행</button>
+              <button className="btn" autoFocus onClick={() => setConfirmOpen(false)}>취소</button>
+              <button className="btn btn-danger" disabled={!preview} onClick={confirmWrite}>
+                {wOp === "del" ? "삭제 실행" : `${Math.max(preview?.rows.length ?? 1, 1)}건 쓰기`}
+              </button>
             </div>
           </div>
         </div>
@@ -852,26 +1100,39 @@ function Banner({ topo, connected, readOnly, profileName, updateInfo, applyingMs
       {profileName && <span className="topo-sub">{profileName}</span>}
       {connected && master ? (
         <>
-          <div className="topo-item">
+          <div className="topo-item" title="앱이 직접 접속해 마스터임을 확인했습니다. 읽기와 쓰기는 모두 여기로 갑니다.">
             <span className="topo-dot dot-up" />
             <span className="badge badge-master">MASTER</span>
             <b className="mono">{master.addr}</b>
           </div>
           {replicas.map((r: Any) => (
-            <div className="topo-item" key={r.addr}>
+            <div
+              className="topo-item"
+              key={r.addr}
+              title={
+                "● = 마스터가 online 으로 보고한 복제본 (앱이 직접 접속한 것은 아님)\n" +
+                "지연 = 이 복제본이 마지막으로 마스터에 응답한 뒤 지난 시간 (마스터 보고).\n" +
+                "1초마다 응답하므로 0~1초가 평소 값입니다."
+              }
+            >
               <span className={"topo-dot " + (r.up ? "dot-up" : "dot-down")} />
               <span className="badge badge-replica">REPLICA</span>
               <span className="mono">{r.addr}</span>
-              <span className="topo-sub">lag {r.lagSeconds}s</span>
+              <span className="topo-sub">지연 {r.lagSeconds}초</span>
             </div>
           ))}
-          <div className="topo-item">
-            <span className="badge">SENTINEL</span>
-            <span className="topo-sub">
-              {sentinels.filter((s: Any) => s.up).length}/{sentinels.length} up · quorum {topo.quorum}
-            </span>
-          </div>
-          <span className="topo-sub">src: {topo.source}</span>
+          <SentinelBox topo={topo} sentinels={sentinels} />
+          {(() => {
+            const s = SRC_LABEL[topo.source] || [topo.source, "", false];
+            return (
+              <span
+                className={s[2] ? "topo-warn" : "topo-sub"}
+                title={(s[1] ? s[1] + "\n" : "") + "3초마다 다시 찾아, 마스터가 바뀌면 따라갑니다."}
+              >
+                {s[0]}
+              </span>
+            );
+          })()}
           {(topo.warnings ?? []).length > 0 && (
             <span className="topo-warn">⚠ {(topo.warnings ?? []).join(" / ")}</span>
           )}
@@ -899,75 +1160,143 @@ function Banner({ topo, connected, readOnly, profileName, updateInfo, applyingMs
           </span>
         )
       )}
-      <span className={"badge " + (readOnly ? "badge-ro" : "badge-rw")}>
-        {readOnly ? "READ-ONLY" : "READ-WRITE"}
-      </span>
+      {profileName && (
+        <span
+          className={"badge " + (readOnly ? "badge-ro" : "badge-rw")}
+          title="선택한 프로필의 설정입니다 (프로필 수정에서 바꿉니다)"
+        >
+          {readOnly ? "읽기 전용" : "쓰기 가능"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// src -> [화면 문구, 툴팁, 경고 여부]
+const SRC_LABEL: Record<string, [string, string, boolean]> = {
+  "sentinel+probe": ["마스터 확인: Sentinel+직접", "노드에 직접 물어 마스터를 찾았고 Sentinel 도 응답했습니다.", false],
+  sentinel: ["마스터 확인: Sentinel 안내", "프로필 노드 중 마스터라고 답한 곳이 없어, Sentinel 이 알려 준 마스터에 직접 확인했습니다.", false],
+  "direct-probe": [
+    "⚠ 마스터 확인: 직접만 — Sentinel 응답 없음",
+    "Sentinel 이 하나도 응답하지 않아, 프로필에 넣은 노드 안에서만 마스터를 찾았습니다.",
+    true,
+  ],
+};
+
+// SentinelBox is the "Sentinel x/y 응답 ▾" button; it unfolds the per-address
+// list (who answered, where the address came from) and what quorum means.
+function SentinelBox({ topo, sentinels }: Any) {
+  const [open, setOpen] = useState(false);
+  const up = sentinels.filter((s: Any) => s.up).length;
+  const partial = sentinels.length === 0 || up < sentinels.length;
+  return (
+    <div className="sentinel-box" onKeyDown={(e) => e.key === "Escape" && setOpen(false)}>
+      <button
+        className={"topo-item sentinel-btn" + (partial ? " warn" : "")}
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        {partial ? "⚠ " : ""}Sentinel {up}/{sentinels.length} 응답 {open ? "▴" : "▾"}
+      </button>
+      {open && (
+        <div className="sentinel-pop">
+          <div className="pop-title">Sentinel {sentinels.length}개 중 {up}개 응답</div>
+          {sentinels.map((s: Any) => (
+            <div className="pop-row" key={s.addr}>
+              <span className={"topo-dot " + (s.up ? "dot-up" : "dot-down")} />
+              <span className="mono">{s.addr}</span>
+              <span>{s.up ? "응답" : "응답 없음"}</span>
+              <span className="dim">{s.source === "announced" ? "Sentinel 이 알려 준 주소" : "프로필 노드"}</span>
+            </div>
+          ))}
+          <div className="pop-foot">quorum {topo.quorum} — 마스터 장애를 확정하는 데 필요한 Sentinel 동의 수 (서버 설정값)</div>
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------- ValueView ----------------
-function ValueView({ selKey, meta, value, showDecoded, setShowDecoded, valErr }: Any) {
+function ValueView({ selKey, meta, value, showDecoded, setShowDecoded, valErr, readAt, connected, masterAddr, onRefresh }: Any) {
   if (valErr) return <div className="err-text">{valErr}</div>;
   if (!selKey) return <div className="empty">키를 선택하면 값이 표시됩니다.</div>;
   if (!value) return <div className="empty">불러오는 중…</div>;
 
   const decoded = value.decoded;
+  const cpField = (kv: Any) => CP_LABEL[kv.field] || kv.field;
   return (
-    <div className="col-scroll">
+    <div className={"col-scroll" + (connected ? "" : " stale")}>
       {meta && (
         <div className="meta-line">
-          <span>type <b className={typeClass(meta.type)}>{meta.type}</b></span>
-          <span>TTL <b>{fmtTTL(meta.ttlSeconds)}</b></span>
-          <span>encoding <b>{meta.encoding || "-"}</b></span>
-          <span>size <b>{fmtBytes(meta.sizeBytes)}</b></span>
-          <span>length <b>{meta.length}</b></span>
+          <b className={typeClass(meta.type)}>{meta.type}</b>
+          <span>{fmtTTL(meta.ttlSeconds)}</span>
+          <span>{lengthLabel(meta.type, meta.length)}</span>
+          <span title={`Redis MEMORY USAGE 근사값 · 내부 인코딩 ${meta.encoding || "-"}`}>
+            메모리 약 {fmtBytes(meta.sizeBytes)} ⓘ
+          </span>
         </div>
       )}
       <div className="value-pane">
-        <div className="mono" style={{ fontSize: 12, color: "#9aa4b2", marginBottom: 10, wordBreak: "break-all" }}>
-          {selKey}
+        <div className="inline value-head">
+          <span className="mono" style={{ fontSize: 12, color: "#9aa4b2", wordBreak: "break-all" }}>{selKey}</span>
+          <span className="grow" />
+          <span className={connected ? "hint-text" : "warn-text"}>
+            {readAt
+              ? connected
+                ? `${clockNow(readAt)} 에 마스터 ${masterAddr} 에서 읽음`
+                : `연결 해제됨 — ${clockNow(readAt)} 에 읽은 값`
+              : ""}
+          </span>
+          <button className="btn btn-xs" disabled={!connected} onClick={onRefresh}>새로고침</button>
         </div>
 
         {decoded && (
           <div className="inline" style={{ marginBottom: 10 }}>
-            <button className={"tab" + (showDecoded ? " active" : "")} onClick={() => setShowDecoded(true)}>Liz 디코딩</button>
-            <button className={"tab" + (!showDecoded ? " active" : "")} onClick={() => setShowDecoded(false)}>원본</button>
+            <button className={"tab" + (showDecoded ? " active" : "")} onClick={() => setShowDecoded(true)}>Liz 형식으로 보기</button>
+            <button className={"tab" + (!showDecoded ? " active" : "")} onClick={() => setShowDecoded(false)}>저장된 그대로</button>
           </div>
         )}
 
         {value.truncated && <div className="truncated">⚠ 값이 커서 일부만 표시됩니다.</div>}
 
-        {/* device: grouped in BOTH modes; the Liz-decoded view adds a 상태 column */}
-        {decoded && decoded.groups && (
+        {/* device, Liz view: grouped by interface, full stored field names, 뜻 column */}
+        {decoded && decoded.groups && showDecoded && (
           <>
             {decoded.groups.map((g: Any, gi: number) => (
               <div key={gi}>
                 <div className="group-title">{g.name}</div>
-                <table className="kv-table">
+                <table className="kv-table three">
+                  <colgroup>
+                    <col style={{ width: "38%" }} />
+                    <col style={{ width: "22%" }} />
+                    <col />
+                  </colgroup>
                   <thead>
                     <tr>
                       <th className="k">필드</th>
                       <th>값</th>
-                      {showDecoded && <th>상태</th>}
+                      <th>뜻</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {g.fields.map((kv: Any, i: number) => (
-                      <tr key={i}>
-                        <td className="k">{kv.field}</td>
-                        <td className="v mono">{kv.value}</td>
-                        {showDecoded && (
+                    {g.fields.map((kv: Any, i: number) => {
+                      const when = msTime(kv.value);
+                      return (
+                        <tr key={i}>
+                          <td className="k mono">{kv.field}</td>
+                          <td className="v mono">{kv.value}</td>
                           <td className="v">
                             {kv.label ? (
-                              <span className={"status-name " + statusColor(kv.label)}>{kv.label}</span>
+                              <span className="status-name st-idle" title={STATUS_TABLE}>{kv.label}</span>
+                            ) : when ? (
+                              <span className="hint-text">{when} (이 PC 시간)</span>
                             ) : (
                               ""
                             )}
                           </td>
-                        )}
-                      </tr>
-                    ))}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -975,15 +1304,35 @@ function ValueView({ selKey, meta, value, showDecoded, setShowDecoded, valErr }:
           </>
         )}
 
-        {/* checkpoint: decoded = labeled fields, raw = the ║ string */}
-        {decoded && decoded.fields && showDecoded && (
+        {/* device, stored view: flat hash exactly as stored */}
+        {decoded && decoded.groups && !showDecoded && (
           <table className="kv-table">
             <tbody>
-              {decoded.fields.map((kv: Any, i: number) => (
-                <tr key={i}><td className="k">{kv.field}</td><td className="v mono">{kv.value}</td></tr>
+              {(value.hash ?? []).map((kv: Any, i: number) => (
+                <tr key={i}><td className="k mono">{kv.field}</td><td className="v mono">{kv.value}</td></tr>
               ))}
             </tbody>
           </table>
+        )}
+
+        {/* checkpoint, Liz view: the stored string, then its parts by name */}
+        {decoded && decoded.fields && showDecoded && (
+          <>
+            <div className="hint-line mono">저장된 문자열 {value.string}</div>
+            <table className="kv-table">
+              <tbody>
+                {decoded.fields.map((kv: Any, i: number) => (
+                  <tr key={i}>
+                    <td className="k">{cpField(kv)}</td>
+                    <td className="v mono">
+                      {kv.value}
+                      {kv.field === "timestamp" && <span className="hint-text"> · 이 PC 시간 ({tzLabel()})</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
         )}
         {decoded && decoded.fields && !showDecoded && (
           <div className="raw-box mono">{value.string}</div>
@@ -1063,7 +1412,11 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
       return;
     }
     if (nodes.length === 0) {
-      alert("노드를 하나 이상 입력하세요.");
+      alert("서버 IP 를 하나 이상 입력하세요.");
+      return;
+    }
+    if (!password) {
+      alert("Redis 비밀번호를 입력하세요.");
       return;
     }
     const aliases: Record<string, string> = {};
@@ -1094,9 +1447,10 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
         </div>
         <div className="modal-body">
           <div className="form-grid" style={{ padding: 0 }}>
-            <label>이름<input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: liz 운영" /></label>
+            <div className="hint-text">Sentinel 구성(Liz 표준)에 연결합니다. * 는 꼭 넣어야 하는 칸입니다.</div>
+            <label>이름 *<input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: liz 운영" /></label>
             <label>
-              노드 (IP, 쉼표/공백 구분 — 개수 자유)
+              서버 IP * (Redis·Sentinel 이 함께 있는 서버를 모두 — 쉼표/공백 구분)
               <input
                 className="mono"
                 value={nodesText}
@@ -1105,19 +1459,19 @@ function ProfileModal({ initial, onSave, onCancel, busy }: Any) {
               />
             </label>
             <div className="row2">
-              <label>Redis 포트<input value={redisPort} onChange={(e) => setRedisPort(e.target.value)} /></label>
-              <label>Sentinel 포트<input value={sentinelPort} onChange={(e) => setSentinelPort(e.target.value)} /></label>
+              <label>Redis 포트 (Liz 표준 5000)<input value={redisPort} onChange={(e) => setRedisPort(e.target.value)} /></label>
+              <label>Sentinel 포트 (Liz 표준 26379)<input value={sentinelPort} onChange={(e) => setSentinelPort(e.target.value)} /></label>
             </div>
-            <label>Master 이름<input className="mono" value={masterName} onChange={(e) => setMasterName(e.target.value)} /></label>
-            <label>Redis 비밀번호<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
-            <label>Sentinel 비밀번호 (보통 비움)<input type="password" value={sentinelPassword} onChange={(e) => setSentinelPassword(e.target.value)} /></label>
+            <label>마스터 이름 (Liz 표준 mymaster)<input className="mono" value={masterName} onChange={(e) => setMasterName(e.target.value)} /></label>
+            <label>Redis 비밀번호 *<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+            <label>Sentinel 비밀번호 (Liz 는 비워 둠)<input type="password" value={sentinelPassword} onChange={(e) => setSentinelPassword(e.target.value)} /></label>
             <label>
-              별칭 hostname=IP (선택, 한 줄에 하나)
-              <textarea rows={2} className="mono" value={aliasText} onChange={(e) => setAliasText(e.target.value)} placeholder="server_1=172.17.64.24" />
+              서버 이름=IP (보통 비워 둠 — 상단에 ⚠ 경고가 안내할 때만, 한 줄에 하나)
+              <textarea rows={2} className="mono" value={aliasText} onChange={(e) => setAliasText(e.target.value)} placeholder="server01=172.17.64.130" />
             </label>
             <label className="chk">
               <input type="checkbox" checked={readOnly} onChange={(e) => setReadOnly(e.target.checked)} />
-              읽기 전용 (안전, 기본 켜짐)
+              읽기 전용 (쓰기 탭 잠금 — 기본 켜짐)
             </label>
           </div>
         </div>
